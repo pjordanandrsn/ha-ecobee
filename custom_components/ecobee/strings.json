@@ -32,7 +32,7 @@
       "auth0_step_authorize": "Auth0 /authorize step failed — the universal-login entry point did not accept our request. Check Settings -> System -> Logs for the 'Ecobee auth: step=authorize' line.",
       "auth0_step_login_form": "Auth0 login form (identifier or password) returned an unexpected response. Check the HA log for 'POST .../login/' lines.",
       "auth0_step_resume": "Auth0 /authorize/resume step failed — login appeared to succeed but the resume redirect was malformed. Check the HA log for 'Ecobee auth: step=resume' lines.",
-      "auth0_step_custom_prompt": "Auth0 surfaced a prompt page (T&C, MFA setup, profile completion) that requires interactive action. Sign in to https://www.ecobee.com from a browser, complete any pending step, then retry the integration setup.",
+      "auth0_step_custom_prompt": "Auth0 surfaced a prompt page (T&C, MFA setup, profile completion) that requires interactive action. Sign in to ecobee.com from a browser, complete any pending step, then retry the integration setup.",
       "auth0_redirect": "Auth0 returned an unexpected redirect. Check the HA log for 'Ecobee auth:' lines.",
       "code_exchange": "Auth0 accepted login but rejected the token exchange (PKCE mismatch?). Check the HA log for the full traceback.",
       "internal": "Unexpected error. Check Settings -> System -> Logs for the full traceback."
