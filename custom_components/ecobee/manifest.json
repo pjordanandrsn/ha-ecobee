@@ -1,0 +1,13 @@
+{
+  "domain": "ecobee",
+  "name": "Ecobee (Anderson fork)",
+  "codeowners": ["@pjordanandrsn"],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/pjordanandrsn/ha-ecobee",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/pjordanandrsn/ha-ecobee/issues",
+  "loggers": ["custom_components.ecobee"],
+  "requirements": [],
+  "version": "0.2.0-anderson-fork"
+}

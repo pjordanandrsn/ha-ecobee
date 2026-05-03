@@ -1,0 +1,50 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Ecobee (Anderson fork)",
+        "description": "Sign in with your ecobee.com account.\n\nThis fork bypasses ecobee's shut-down developer portal by using your account password directly. If your account has two-factor authentication (2FA) enabled, you'll be prompted for your second-factor code on the next step.",
+        "data": {
+          "username": "Email",
+          "password": "Password"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate Ecobee",
+        "description": "The session for {username} has expired. Enter your password to refresh it. If 2FA is enabled, you'll be asked for your second-factor code on the next step.",
+        "data": {
+          "password": "Password"
+        }
+      },
+      "mfa_select_factor": {
+        "title": "Choose a verification method",
+        "description": "Your ecobee account ({username}) has multiple two-factor methods configured. Pick which one you want to use.",
+        "data": {
+          "authenticator_id": "Verification method"
+        }
+      },
+      "mfa_code": {
+        "title": "Enter your verification code",
+        "description": "Enter the verification code from {factor} for the account {username}. For an authenticator app, use the current 6-digit code; for SMS, use the code that was just texted to you.",
+        "data": {
+          "code": "Verification code"
+        }
+      }
+    },
+    "error": {
+      "auth": "Invalid email or password.",
+      "mfa_unsupported": "This MFA method isn't supported yet (push notifications can't be wired through this integration). Configure an authenticator app or SMS as a backup factor on your ecobee account and try again.",
+      "mfa_no_factors": "Your ecobee account requires 2FA but no usable verification methods were returned. Open ecobee.com -> account security and confirm at least one authenticator (app or SMS) is active, then try again.",
+      "mfa_invalid_code": "That code didn't match. Try again.",
+      "mfa_expired": "Your verification session expired. Re-enter your email and password to start over.",
+      "mfa_rate_limited": "Too many incorrect codes. Wait a few minutes before trying again.",
+      "mfa_push_unsupported": "Push-notification MFA is not yet supported by this integration. Pick an authenticator app or SMS factor instead.",
+      "auth0_unreachable": "Could not reach auth.ecobee.com. Check the HA host's outbound network/DNS.",
+      "internal": "Unexpected error. Check Settings -> System -> Logs for the full traceback."
+    },
+    "abort": {
+      "already_configured": "This account is already configured.",
+      "reauth_successful": "Re-authentication successful."
+    }
+  }
+}
