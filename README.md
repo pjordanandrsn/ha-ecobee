@@ -225,6 +225,26 @@ python3 -m venv /tmp/ecobee-test-venv
 CI runs these on every push and PR — see
 [`.github/workflows/tests.yaml`](.github/workflows/tests.yaml).
 
+## Community + upstream tracking
+
+- [Discussion of the dev-portal closure that motivated this fork][forum-thread]
+- [HA core issues tracking the dev-portal closure][ha-core-issues]:
+  [#131789][issue-131789], [#169328][issue-169328], [#146560][issue-146560]
+- [Sibling fork using the same Auth0 universal-login pattern][ha-generac]
+- Inspirations: [`r00k/ecobee-cli`][r00k] (auth pattern reference),
+  [`JJTech0130/ha-ecobee`][jjtech-fork] (early dev-portal-bypass attempt),
+  [`nkgilley/python-ecobee-api`][pyecobee] +
+  [`mikeg0/ecobeectl`][ecobeectl] (mobile-app constants reference)
+
+[forum-thread]: https://community.home-assistant.io/t/ecobee-dumped-developer-accounts/711817
+[ha-core-issues]: https://github.com/home-assistant/core/issues
+[issue-131789]: https://github.com/home-assistant/core/issues/131789
+[issue-169328]: https://github.com/home-assistant/core/issues/169328
+[issue-146560]: https://github.com/home-assistant/core/issues/146560
+[ha-generac]: https://github.com/pjordanandrsn/ha-generac
+[jjtech-fork]: https://github.com/JJTech0130/ha-ecobee
+[ecobeectl]: https://github.com/mikeg0/ecobeectl
+
 ## License
 
 [Apache 2.0][license]. This integration is original work modeled on
