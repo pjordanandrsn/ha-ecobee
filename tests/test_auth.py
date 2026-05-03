@@ -1,21 +1,28 @@
-"""Tests for the ecobee Auth0 ROPG client."""
+"""Tests for the v0.3 ecobee Auth0 universal-login client."""
 
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, MagicMock
+import urllib.parse
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from custom_components.ecobee.auth import (
     EcobeeAuth,
     InvalidCredentialsError,
     InvalidGrantError,
-    MFAExpiredError,
-    MFAInvalidCodeError,
-    MFANotSupportedError,
-    MFARateLimitedError,
-    MFARequiredError,
+    _authorize,
+    _exchange_code,
+    _handle_custom_prompt,
+    _identifier_step,
+    _password_step,
+    _resume_to_code,
 )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
 def _acm(resp):
@@ -26,7 +33,26 @@ def _acm(resp):
     return cm
 
 
+def _redir(location: str, status: int = 302):
+    """Build a 302/303-shaped response object."""
+    resp = MagicMock()
+    resp.status = status
+    resp.headers = {"Location": location}
+    resp.text = AsyncMock(return_value="")
+    return resp
+
+
+def _html(status: int, body: str = "<html></html>"):
+    """Build an HTML response (typically 200 + page body)."""
+    resp = MagicMock()
+    resp.status = status
+    resp.headers = {}
+    resp.text = AsyncMock(return_value=body)
+    return resp
+
+
 def _token_resp(status: int, body: dict):
+    """Build a /oauth/token response."""
     resp = MagicMock()
     resp.status = status
     resp.text = AsyncMock(return_value=json.dumps(body))
@@ -39,40 +65,41 @@ def _make_auth(refresh_token: str = "rt-OLD") -> EcobeeAuth:
     return EcobeeAuth(session, refresh_token, email="user@example.com")
 
 
-def _seq_session(*responses):
-    """Build a MagicMock session whose .post / .get return responses in order.
+def _routed_session(get_responses=None, post_responses=None):
+    """Build a MagicMock session with separate FIFO queues for get / post.
 
-    The MFA dance issues multiple HTTP calls per logical operation
-    (e.g. password POST -> /mfa/authenticators GET when login() detects
-    MFA, or /mfa/challenge POST -> /oauth/token POST). To keep the
-    per-test wiring readable we feed responses in chronological order
-    and route them based on URL prefix.
+    Universal-login interleaves GETs (/, /authorize/resume, /u/* page
+    fetches) with POSTs (/u/login/identifier, /u/login/password,
+    /u/custom-prompt POSTs, /oauth/token). Splitting the queues keeps
+    the per-test wiring readable without having to interleave by URL
+    inside a router.
     """
-    # Split responses into post / get queues by URL prefix later. We
-    # keep one global queue and a router that pulls from it FIFO; this
-    # mirrors how ``await session.post(...)`` and ``await session.get(...)``
-    # would interleave at runtime.
-    queue = list(responses)
+    get_q = list(get_responses or [])
+    post_q = list(post_responses or [])
 
-    def _ctx(*_args, **_kwargs):
-        if not queue:
-            raise AssertionError("session HTTP call exceeded queued responses")
-        return _acm(queue.pop(0))
+    def _get_ctx(*_args, **_kwargs):
+        if not get_q:
+            raise AssertionError("session.get exceeded queued responses")
+        return _acm(get_q.pop(0))
+
+    def _post_ctx(*_args, **_kwargs):
+        if not post_q:
+            raise AssertionError("session.post exceeded queued responses")
+        return _acm(post_q.pop(0))
 
     session = MagicMock()
-    session.post = MagicMock(side_effect=_ctx)
-    session.get = MagicMock(side_effect=_ctx)
+    session.get = MagicMock(side_effect=_get_ctx)
+    session.post = MagicMock(side_effect=_post_ctx)
     return session
 
 
 # ---------------------------------------------------------------------------
-# P0: refresh-token rotation persistence
+# P0: refresh-token rotation persistence (kept from v0.2 — unchanged behaviour)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_refresh_persist_callback_fires_on_rotation():
-    """When Auth0 rotates the RT, the persist callback runs with the new RT."""
     auth = _make_auth(refresh_token="rt-OLD")
     auth._session.post = MagicMock(
         return_value=_acm(
@@ -101,7 +128,6 @@ async def test_refresh_persist_callback_fires_on_rotation():
 
 @pytest.mark.asyncio
 async def test_refresh_persist_callback_not_called_when_rt_unchanged():
-    """Server returns the same RT (no rotation) -> persist cb not called."""
     auth = _make_auth(refresh_token="rt-OLD")
     auth._session.post = MagicMock(
         return_value=_acm(
@@ -127,7 +153,6 @@ async def test_refresh_persist_callback_not_called_when_rt_unchanged():
 
 @pytest.mark.asyncio
 async def test_refresh_persist_callback_not_called_when_omitted():
-    """Server omits refresh_token entirely -> persist cb not called."""
     auth = _make_auth(refresh_token="rt-OLD")
     auth._session.post = MagicMock(
         return_value=_acm(
@@ -148,8 +173,8 @@ async def test_refresh_persist_callback_not_called_when_omitted():
 
 
 @pytest.mark.asyncio
-async def test_refresh_invalid_grant_raises():
-    """A 400 invalid_grant from /oauth/token must raise InvalidGrantError."""
+async def test_refresh_invalid_grant_triggers_reauth():
+    """A 400 invalid_grant raises InvalidGrantError so __init__.py can map it."""
     auth = _make_auth(refresh_token="rt-REVOKED")
     auth._session.post = MagicMock(
         return_value=_acm(
@@ -169,13 +194,10 @@ async def test_refresh_unknown_4xx_raises_runtime_error():
     """Unknown error shape comes through as RuntimeError, not InvalidGrant."""
     auth = _make_auth(refresh_token="rt-X")
     auth._session.post = MagicMock(
-        return_value=_acm(
-            _token_resp(400, {"error": "transient_503"}),
-        )
+        return_value=_acm(_token_resp(400, {"error": "transient_503"}))
     )
     with pytest.raises(RuntimeError) as exc_info:
         await auth._refresh()
-    # Must not be an InvalidGrantError or it'd trigger an unwanted reauth.
     assert not isinstance(exc_info.value, InvalidGrantError)
 
 
@@ -197,23 +219,45 @@ async def test_refresh_persist_callback_failure_swallowed():
 
     auth.set_refresh_token_persist_callback(boom)
 
-    # Must NOT raise — we logged it but the new AT is still valid for
-    # the rest of this process's lifetime.
     await auth._refresh()
     assert auth._access_token == "AT-2"
 
 
+@pytest.mark.asyncio
+async def test_refresh_success_updates_refresh_token():
+    """Happy-path refresh updates AT, expiry, and rotated RT."""
+    auth = _make_auth(refresh_token="rt-OLD")
+    auth._session.post = MagicMock(
+        return_value=_acm(
+            _token_resp(
+                200,
+                {
+                    "access_token": "AT-NEW",
+                    "expires_in": 3600,
+                    "refresh_token": "rt-ROTATED",
+                },
+            )
+        )
+    )
+    persist_cb = AsyncMock()
+    auth.set_refresh_token_persist_callback(persist_cb)
+
+    await auth._refresh()
+
+    assert auth._access_token == "AT-NEW"
+    assert auth._refresh_token == "rt-ROTATED"
+    persist_cb.assert_awaited_once_with("rt-ROTATED")
+
+
 # ---------------------------------------------------------------------------
-# P0: ensure_access_token caching + lock
+# P0: ensure_access_token caching + lock (kept from v0.2)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_ensure_access_token_returns_cached_when_fresh():
-    """If the cached AT hasn't expired, no /oauth/token POST happens."""
     auth = _make_auth()
     auth._access_token = "cached-AT"
-    # Long expiry into the future.
     import time as _t
     auth._access_token_exp = _t.time() + 3600
     auth._session.post = MagicMock(
@@ -224,10 +268,9 @@ async def test_ensure_access_token_returns_cached_when_fresh():
 
 @pytest.mark.asyncio
 async def test_ensure_access_token_refreshes_when_expired():
-    """A stale AT triggers a refresh; subsequent call returns the fresh one."""
     auth = _make_auth(refresh_token="rt-OLD")
     auth._access_token = "stale-AT"
-    auth._access_token_exp = 0  # already expired
+    auth._access_token_exp = 0
 
     auth._session.post = MagicMock(
         return_value=_acm(
@@ -241,113 +284,6 @@ async def test_ensure_access_token_refreshes_when_expired():
     assert new == "fresh-AT"
 
 
-# ---------------------------------------------------------------------------
-# P0: ROPG login (success path + MFA detection + invalid creds)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_login_happy_path():
-    session = MagicMock()
-    session.post = MagicMock(
-        return_value=_acm(
-            _token_resp(
-                200,
-                {
-                    "access_token": "AT-login",
-                    "refresh_token": "RT-login",
-                    "expires_in": 3600,
-                    "scope": "openid offline_access",
-                    "token_type": "Bearer",
-                },
-            )
-        )
-    )
-    auth = await EcobeeAuth.login(session, "user@example.com", "secret")
-    assert auth.refresh_token == "RT-login"
-    assert auth._access_token == "AT-login"
-    assert auth.email == "user@example.com"
-
-
-@pytest.mark.asyncio
-async def test_login_invalid_grant_maps_to_invalid_credentials():
-    session = MagicMock()
-    session.post = MagicMock(
-        return_value=_acm(
-            _token_resp(
-                400,
-                {"error": "invalid_grant", "error_description": "Wrong email or password."},
-            )
-        )
-    )
-    with pytest.raises(InvalidCredentialsError):
-        await EcobeeAuth.login(session, "user@example.com", "wrong")
-
-
-@pytest.mark.asyncio
-async def test_login_mfa_without_token_raises_unsupported():
-    """If Auth0 says MFA but doesn't supply mfa_token, we can't continue."""
-    session = MagicMock()
-    session.post = MagicMock(
-        return_value=_acm(
-            _token_resp(
-                400,
-                {
-                    "error": "invalid_request",
-                    "error_description": "Multifactor authentication required.",
-                },
-            )
-        )
-    )
-    with pytest.raises(MFANotSupportedError):
-        await EcobeeAuth.login(session, "user@example.com", "anything")
-
-
-@pytest.mark.asyncio
-async def test_login_mfa_alternative_phrasing_still_caught():
-    """Substring match on 'mfa' catches alt phrasings too (no mfa_token -> Unsupported)."""
-    session = MagicMock()
-    session.post = MagicMock(
-        return_value=_acm(
-            _token_resp(
-                400,
-                {
-                    "error": "mfa_required",
-                    "error_description": "Please provide MFA token.",
-                },
-            )
-        )
-    )
-    with pytest.raises(MFANotSupportedError):
-        await EcobeeAuth.login(session, "u@e.com", "x")
-
-
-@pytest.mark.asyncio
-async def test_login_no_refresh_token_in_response_raises_runtime():
-    """A 200 without a refresh_token means we asked for the wrong scope."""
-    session = MagicMock()
-    session.post = MagicMock(
-        return_value=_acm(
-            _token_resp(
-                200,
-                {"access_token": "AT-only", "expires_in": 3600},
-            )
-        )
-    )
-    with pytest.raises(RuntimeError):
-        await EcobeeAuth.login(session, "u@e.com", "x")
-
-
-@pytest.mark.asyncio
-async def test_login_unknown_5xx_raises_runtime_error():
-    session = MagicMock()
-    session.post = MagicMock(
-        return_value=_acm(_token_resp(503, {"error": "service_unavailable"}))
-    )
-    with pytest.raises(RuntimeError):
-        await EcobeeAuth.login(session, "u@e.com", "x")
-
-
 def test_from_storage_constructs_without_network():
     """from_storage is a pure constructor — no I/O."""
     session = MagicMock()
@@ -357,269 +293,493 @@ def test_from_storage_constructs_without_network():
 
 
 # ---------------------------------------------------------------------------
-# v0.2: MFA flow
+# v0.3: per-step universal-login coverage
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_login_mfa_required_raises_with_token_and_factors():
-    """Password POST returns 403 mfa_required + mfa_token; login enriches with factors."""
-    factors = [
-        {
-            "id": "totp|abc",
-            "authenticator_type": "otp",
-            "name": "Authenticator app",
-            "active": True,
-        },
-        {
-            "id": "sms|xyz",
-            "authenticator_type": "oob",
-            "oob_channel": "sms",
-            "name": "XXX-XXX-1234",
-            "active": True,
-        },
-    ]
-    # Sequence: password POST (403 mfa_required) -> /mfa/authenticators GET.
-    session = _seq_session(
-        _token_resp(
-            403,
-            {
-                "error": "mfa_required",
-                "error_description": "Multifactor authentication required",
-                "mfa_token": "MFA-JWT-1",
-            },
-        ),
-        _token_resp(200, factors),
+async def test_authorize_returns_state():
+    """GET /authorize -> 302 to /u/login/identifier?state=..."""
+    session = _routed_session(
+        get_responses=[
+            _redir("https://auth.ecobee.com/u/login/identifier?state=AUTH-STATE"),
+        ]
     )
-    with pytest.raises(MFARequiredError) as exc_info:
-        await EcobeeAuth.login(session, "u@e.com", "secret")
-    assert exc_info.value.mfa_token == "MFA-JWT-1"
-    assert len(exc_info.value.authenticators) == 2
-    types = {a["authenticator_type"] for a in exc_info.value.authenticators}
-    assert types == {"otp", "oob"}
+    state = await _authorize(session, state="initial", challenge="CHAL")
+    assert state == "AUTH-STATE"
 
 
 @pytest.mark.asyncio
-async def test_list_mfa_authenticators_returns_active_only():
-    """Inactive authenticators are filtered out so the form doesn't offer them."""
-    session = _seq_session(
-        _token_resp(
-            200,
-            [
-                {"id": "a", "authenticator_type": "otp", "active": True},
-                {"id": "b", "authenticator_type": "oob", "active": False},
-                {"id": "c", "authenticator_type": "otp"},  # missing -> default True
-            ],
-        )
-    )
-    out = await EcobeeAuth.list_mfa_authenticators(session, "MFA-JWT")
-    ids = {a["id"] for a in out}
-    assert ids == {"a", "c"}
+async def test_authorize_non_redirect_raises():
+    session = _routed_session(get_responses=[_html(200, "<html>error</html>")])
+    with pytest.raises(RuntimeError) as exc_info:
+        await _authorize(session, state="initial", challenge="CHAL")
+    assert "step=authorize" in str(exc_info.value)
 
 
 @pytest.mark.asyncio
-async def test_challenge_mfa_otp_is_noop():
-    """OTP factors don't need a challenge call — challenge_mfa returns None."""
-    session = MagicMock()
-    session.post = MagicMock(side_effect=AssertionError("OTP must not POST /mfa/challenge"))
-    out = await EcobeeAuth.challenge_mfa(
+async def test_identifier_step_advances_to_password():
+    """POST /u/login/identifier -> 302 to /u/login/password?state=..."""
+    session = _routed_session(
+        post_responses=[
+            _redir("https://auth.ecobee.com/u/login/password?state=PW-STATE"),
+        ]
+    )
+    state = await _identifier_step(session, "AUTH-STATE", "user@example.com")
+    assert state == "PW-STATE"
+
+
+@pytest.mark.asyncio
+async def test_identifier_step_unknown_email_raises_invalid_credentials():
+    """Auth0 sends us back to /u/login/identifier when the email is bad."""
+    session = _routed_session(
+        post_responses=[
+            _redir("https://auth.ecobee.com/u/login/identifier?state=BACK"),
+        ]
+    )
+    with pytest.raises(InvalidCredentialsError):
+        await _identifier_step(session, "AUTH-STATE", "noone@nowhere.com")
+
+
+@pytest.mark.asyncio
+async def test_password_step_advances_to_resume():
+    """POST /u/login/password -> 302 to /authorize/resume?state=..."""
+    session = _routed_session(
+        post_responses=[
+            _redir("https://auth.ecobee.com/authorize/resume?state=RESUME-STATE"),
+        ]
+    )
+    state = await _password_step(
+        session, "PW-STATE", "user@example.com", "secret"
+    )
+    assert state == "RESUME-STATE"
+
+
+@pytest.mark.asyncio
+async def test_password_rejected_raises_invalid_credentials():
+    """Auth0 returns a 400 with data-error-code='invalid_password'."""
+    body = (
+        '<html><span class="ulp-input-error-message" '
+        'data-error-code="invalid_password">Wrong password</span></html>'
+    )
+    bad_resp = MagicMock()
+    bad_resp.status = 400
+    bad_resp.headers = {}
+    bad_resp.text = AsyncMock(return_value=body)
+    session = _routed_session(post_responses=[bad_resp])
+    with pytest.raises(InvalidCredentialsError):
+        await _password_step(session, "PW-STATE", "user@example.com", "wrong")
+
+
+@pytest.mark.asyncio
+async def test_resume_returns_code_on_app_callback():
+    """GET /authorize/resume -> 302 to web callback ?code=&state=."""
+    session = _routed_session(
+        get_responses=[
+            _redir(
+                "https://www.ecobee.com/home/authCallback?code=AUTHCODE-1&state=ST"
+            ),
+        ]
+    )
+    code = await _resume_to_code(session, "RESUME-STATE")
+    assert code == "AUTHCODE-1"
+
+
+@pytest.mark.asyncio
+async def test_resume_handles_custom_prompt_chain():
+    """One /u/custom-prompt page in the middle is handled and chain completes."""
+    # GET responses: resume (-> custom-prompt), GET on custom-prompt page,
+    # GET resume again (-> callback).
+    custom_prompt_loc = (
+        "https://auth.ecobee.com/u/custom-prompt/abc?state=CUSTOM-STATE"
+    )
+    callback_loc = (
+        "https://www.ecobee.com/home/authCallback?code=AUTHCODE-2&state=ST"
+    )
+    # POST responses: prompt-POST -> redirect to /authorize/resume.
+    next_resume_loc = "https://auth.ecobee.com/authorize/resume?state=RESUME-2"
+    session = _routed_session(
+        get_responses=[
+            _redir(custom_prompt_loc),
+            _html(200, "<script id=\"__NEXT_DATA__\">{\"props\":{}}</script>"),
+            _redir(callback_loc),
+        ],
+        post_responses=[
+            _redir(next_resume_loc),
+        ],
+    )
+    code = await _resume_to_code(session, "RESUME-1")
+    assert code == "AUTHCODE-2"
+
+
+@pytest.mark.asyncio
+async def test_resume_with_mfa_prompt_chain():
+    """Auth0 /u/mfa-otp-challenge goes through the same generic prompt handler."""
+    # Initial resume -> /u/mfa-otp-challenge
+    # GET prompt page returns 200 (we just inspect the props)
+    # POST prompt -> /authorize/resume
+    # second resume -> callback w/ code
+    mfa_loc = (
+        "https://auth.ecobee.com/u/mfa-otp-challenge?state=MFA-STATE"
+    )
+    next_resume_loc = "https://auth.ecobee.com/authorize/resume?state=RESUME-3"
+    callback_loc = (
+        "https://www.ecobee.com/home/authCallback?code=AUTHCODE-MFA&state=ST"
+    )
+    session = _routed_session(
+        get_responses=[
+            _redir(mfa_loc),
+            _html(200, "<html><body>mfa prompt</body></html>"),
+            _redir(callback_loc),
+        ],
+        post_responses=[
+            _redir(next_resume_loc),
+        ],
+    )
+    code = await _resume_to_code(session, "RESUME-1")
+    assert code == "AUTHCODE-MFA"
+
+
+@pytest.mark.asyncio
+async def test_resume_loop_bound_raises_after_too_many_prompts():
+    """6 chained /u/* prompts in a row exceeds the 5-attempt loop bound."""
+    prompt_loc = (
+        "https://auth.ecobee.com/u/custom-prompt/x?state=PROMPT-{}"
+    )
+    next_resume_loc = (
+        "https://auth.ecobee.com/authorize/resume?state=RESUME-{}"
+    )
+    # 5 iterations: each iteration consumes resume-GET + prompt-page-GET
+    # + prompt-POST. So queue 5x of each.
+    session = _routed_session(
+        get_responses=[
+            _redir(prompt_loc.format(i)) for i in range(5)
+        ] + [_html(200, "<html></html>") for _ in range(5)],
+        post_responses=[
+            _redir(next_resume_loc.format(i)) for i in range(5)
+        ],
+    )
+    # Re-interleave: each loop iteration is GET resume -> GET page ->
+    # POST page. Re-queue accordingly.
+    session = _routed_session(
+        get_responses=[
+            _redir(prompt_loc.format(0)),
+            _html(200, "<html></html>"),
+            _redir(prompt_loc.format(1)),
+            _html(200, "<html></html>"),
+            _redir(prompt_loc.format(2)),
+            _html(200, "<html></html>"),
+            _redir(prompt_loc.format(3)),
+            _html(200, "<html></html>"),
+            _redir(prompt_loc.format(4)),
+            _html(200, "<html></html>"),
+        ],
+        post_responses=[
+            _redir(next_resume_loc.format(i)) for i in range(5)
+        ],
+    )
+    with pytest.raises(RuntimeError) as exc_info:
+        await _resume_to_code(session, "INITIAL-STATE")
+    assert "5 consecutive Auth0 prompts" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_handle_custom_prompt_returns_resume_state():
+    """Generic /u/* prompt POST -> redirect to /authorize/resume?state=NEW."""
+    session = _routed_session(
+        get_responses=[_html(200, "<html></html>")],
+        post_responses=[
+            _redir(
+                "https://auth.ecobee.com/authorize/resume?state=NEW-RESUME"
+            ),
+        ],
+    )
+    new_state = await _handle_custom_prompt(
         session,
-        mfa_token="MFA-JWT",
-        authenticator_id="totp|abc",
-        authenticator_type="otp",
+        "https://auth.ecobee.com/u/custom-prompt/abc?state=PROMPT-STATE",
     )
-    assert out is None
+    assert new_state == "NEW-RESUME"
 
 
 @pytest.mark.asyncio
-async def test_challenge_mfa_oob_returns_oob_code():
-    """OOB factors POST /mfa/challenge and the oob_code threads to submit."""
-    session = _seq_session(
-        _token_resp(
-            200,
-            {
-                "challenge_type": "oob",
-                "oob_code": "OOB-CODE-1",
-                "binding_method": "prompt",
-            },
-        )
+async def test_handle_custom_prompt_200_raises_actionable_error():
+    """If POST returns 200 (not 302), prompt requires user interaction."""
+    bad = MagicMock()
+    bad.status = 200
+    bad.headers = {}
+    bad.text = AsyncMock(return_value="<html>still here</html>")
+    session = _routed_session(
+        get_responses=[_html(200, "<html></html>")],
+        post_responses=[bad],
     )
-    out = await EcobeeAuth.challenge_mfa(
-        session,
-        mfa_token="MFA-JWT",
-        authenticator_id="sms|xyz",
-        authenticator_type="oob",
-    )
-    assert out is not None
-    assert out["oob_code"] == "OOB-CODE-1"
-
-
-@pytest.mark.asyncio
-async def test_submit_mfa_otp_success_returns_auth_handle():
-    """OTP grant returns the same shape as password grant -> auth handle."""
-    session = _seq_session(
-        _token_resp(
-            200,
-            {
-                "access_token": "AT-MFA",
-                "refresh_token": "RT-MFA",
-                "expires_in": 3600,
-                "scope": "openid offline_access",
-                "token_type": "Bearer",
-            },
-        )
-    )
-    auth = await EcobeeAuth.submit_mfa(
-        session,
-        mfa_token="MFA-JWT",
-        authenticator_type="otp",
-        code="123456",
-        email="u@e.com",
-    )
-    assert auth.refresh_token == "RT-MFA"
-    assert auth._access_token == "AT-MFA"
-    assert auth.email == "u@e.com"
-
-
-@pytest.mark.asyncio
-async def test_submit_mfa_oob_success_returns_auth_handle():
-    """OOB grant supplies oob_code + binding_code; same return shape."""
-    session = _seq_session(
-        _token_resp(
-            200,
-            {
-                "access_token": "AT-OOB",
-                "refresh_token": "RT-OOB",
-                "expires_in": 3600,
-            },
-        )
-    )
-    auth = await EcobeeAuth.submit_mfa(
-        session,
-        mfa_token="MFA-JWT",
-        authenticator_type="oob",
-        code="654321",
-        oob_code="OOB-CODE-1",
-        email="u@e.com",
-    )
-    assert auth.refresh_token == "RT-OOB"
-    assert auth._access_token == "AT-OOB"
-
-
-@pytest.mark.asyncio
-async def test_submit_mfa_wrong_code_raises_invalid_code():
-    """Auth0's 'Invalid otp_code' surfaces as MFAInvalidCodeError so flow can retry."""
-    session = _seq_session(
-        _token_resp(
-            403,
-            {
-                "error": "invalid_grant",
-                "error_description": "Invalid otp_code",
-            },
-        )
-    )
-    with pytest.raises(MFAInvalidCodeError):
-        await EcobeeAuth.submit_mfa(
+    with pytest.raises(RuntimeError) as exc_info:
+        await _handle_custom_prompt(
             session,
-            mfa_token="MFA-JWT",
-            authenticator_type="otp",
-            code="000000",
+            "https://auth.ecobee.com/u/custom-prompt/x?state=ST",
         )
+    msg = str(exc_info.value)
+    assert "step=custom-prompt" in msg
+    assert "ecobee.com" in msg
+
+
+# ---------------------------------------------------------------------------
+# v0.3: token exchange
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_submit_mfa_expired_token_raises_expired():
-    """An aged-out mfa_token gets a dedicated typed error so flow can restart."""
-    session = _seq_session(
-        _token_resp(
-            403,
-            {
-                "error": "invalid_grant",
-                "error_description": "mfa_token expired",
-            },
-        )
+async def test_exchange_code_success():
+    """POST /oauth/token grant_type=authorization_code -> tokens dict."""
+    session = _routed_session(
+        post_responses=[
+            _token_resp(
+                200,
+                {
+                    "access_token": "AT-1",
+                    "refresh_token": "RT-1",
+                    "expires_in": 3600,
+                    "scope": "openid offline_access",
+                    "token_type": "Bearer",
+                },
+            )
+        ]
     )
-    with pytest.raises(MFAExpiredError):
-        await EcobeeAuth.submit_mfa(
-            session,
-            mfa_token="MFA-JWT",
-            authenticator_type="otp",
-            code="000000",
-        )
+    tokens = await _exchange_code(session, code="AUTHCODE", verifier="VERIF")
+    assert tokens["access_token"] == "AT-1"
+    assert tokens["refresh_token"] == "RT-1"
 
 
 @pytest.mark.asyncio
-async def test_submit_mfa_rate_limited_raises_typed_error():
-    """429 too_many_attempts -> dedicated rate-limit error."""
-    session = _seq_session(
-        _token_resp(
-            429,
-            {
-                "error": "too_many_attempts",
-                "error_description": "Too many MFA attempts",
-            },
-        )
+async def test_exchange_code_invalid_grant_raises():
+    """Auth0 rejects code -> RuntimeError; not InvalidGrant (init-time only)."""
+    session = _routed_session(
+        post_responses=[
+            _token_resp(400, {"error": "invalid_grant", "error_description": "bad code"})
+        ]
     )
-    with pytest.raises(MFARateLimitedError):
-        await EcobeeAuth.submit_mfa(
-            session,
-            mfa_token="MFA-JWT",
-            authenticator_type="otp",
-            code="111111",
-        )
+    with pytest.raises(RuntimeError) as exc_info:
+        await _exchange_code(session, code="BAD", verifier="V")
+    assert "code exchange failed" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# v0.3: end-to-end EcobeeAuth.login
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_submit_mfa_push_factor_not_supported():
-    """Push factors are recognised but rejected with a clear error."""
-    session = MagicMock()
-    session.post = MagicMock(side_effect=AssertionError("must reject before any HTTP call"))
-    with pytest.raises(MFANotSupportedError):
-        await EcobeeAuth.submit_mfa(
-            session,
-            mfa_token="MFA-JWT",
-            authenticator_type="push-notification",
-            code="anything",
-        )
+async def test_full_login_e2e_no_mfa():
+    """End-to-end login on a non-MFA account: 5 steps, returns ready EcobeeAuth.
 
-
-@pytest.mark.asyncio
-async def test_refresh_after_mfa_does_not_require_mfa_again():
-    """Once we've got the post-MFA refresh_token, subsequent /oauth/token refresh
-    has no MFA prompt — verify the flow by exchanging RT-MFA for a fresh AT
-    using the regular refresh_token grant.
+    auth.login() builds its own private cookie-jar session; we patch
+    aiohttp.ClientSession to return a routed-session mock so we can
+    assert the full chain end-to-end.
     """
-    # Seed a fresh auth handle as if it had just come out of submit_mfa.
-    session = _seq_session(
-        _token_resp(
-            200,
-            {
-                "access_token": "AT-MFA",
-                "refresh_token": "RT-MFA",
-                "expires_in": 3600,
-            },
-        ),
-        # Then a refresh_token POST returns a new AT (and possibly the
-        # same RT — Auth0 rotation depends on tenant config).
-        _token_resp(
-            200,
-            {
-                "access_token": "AT-REFRESHED",
-                "refresh_token": "RT-MFA",
-                "expires_in": 3600,
-            },
-        ),
+    # Internal session: routed mock that returns the right responses
+    # for each step in order.
+    chain = _routed_session(
+        get_responses=[
+            # /authorize -> /u/login/identifier
+            _redir("https://auth.ecobee.com/u/login/identifier?state=A"),
+            # /authorize/resume -> callback
+            _redir(
+                "https://www.ecobee.com/home/authCallback?code=CODE&state=ST"
+            ),
+        ],
+        post_responses=[
+            # /u/login/identifier -> /u/login/password
+            _redir("https://auth.ecobee.com/u/login/password?state=B"),
+            # /u/login/password -> /authorize/resume
+            _redir("https://auth.ecobee.com/authorize/resume?state=C"),
+            # /oauth/token (code exchange)
+            _token_resp(
+                200,
+                {
+                    "access_token": "AT-final",
+                    "refresh_token": "RT-final",
+                    "expires_in": 3600,
+                },
+            ),
+        ],
     )
-    auth = await EcobeeAuth.submit_mfa(
-        session,
-        mfa_token="MFA-JWT",
-        authenticator_type="otp",
-        code="123456",
-        email="u@e.com",
+
+    # The outer session passed to login() is just stored as
+    # self._session (used for refresh). It doesn't make any HTTP
+    # calls during login(); login() builds its own cookie-jar session.
+    outer_session = MagicMock()
+
+    chain_cm = MagicMock()
+    chain_cm.__aenter__ = AsyncMock(return_value=chain)
+    chain_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with patch(
+        "custom_components.ecobee.auth.aiohttp.ClientSession",
+        return_value=chain_cm,
+    ):
+        auth = await EcobeeAuth.login(outer_session, "user@example.com", "secret")
+
+    assert auth.refresh_token == "RT-final"
+    assert auth._access_token == "AT-final"
+    assert auth.email == "user@example.com"
+
+
+@pytest.mark.asyncio
+async def test_full_login_e2e_with_custom_prompt():
+    """End-to-end login that hits one /u/custom-prompt before the callback."""
+    chain = _routed_session(
+        get_responses=[
+            # /authorize -> /u/login/identifier
+            _redir("https://auth.ecobee.com/u/login/identifier?state=A"),
+            # /authorize/resume -> /u/custom-prompt/<id>
+            _redir(
+                "https://auth.ecobee.com/u/custom-prompt/tnc?state=PROMPT"
+            ),
+            # GET prompt page (for diagnostics — handler then POSTs)
+            _html(200, "<html><body>T&C</body></html>"),
+            # second /authorize/resume -> callback
+            _redir(
+                "https://www.ecobee.com/home/authCallback?code=PC&state=ST"
+            ),
+        ],
+        post_responses=[
+            # /u/login/identifier -> /u/login/password
+            _redir("https://auth.ecobee.com/u/login/password?state=B"),
+            # /u/login/password -> /authorize/resume
+            _redir("https://auth.ecobee.com/authorize/resume?state=C"),
+            # POST /u/custom-prompt -> /authorize/resume
+            _redir("https://auth.ecobee.com/authorize/resume?state=D"),
+            # /oauth/token (code exchange)
+            _token_resp(
+                200,
+                {
+                    "access_token": "AT-prompt",
+                    "refresh_token": "RT-prompt",
+                    "expires_in": 3600,
+                },
+            ),
+        ],
     )
-    # Force the refresh path; no MFA error should be raised.
-    auth._access_token = None
-    auth._access_token_exp = 0
-    new_at = await auth.ensure_access_token()
-    assert new_at == "AT-REFRESHED"
-    assert auth.refresh_token == "RT-MFA"
+
+    outer_session = MagicMock()
+    chain_cm = MagicMock()
+    chain_cm.__aenter__ = AsyncMock(return_value=chain)
+    chain_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with patch(
+        "custom_components.ecobee.auth.aiohttp.ClientSession",
+        return_value=chain_cm,
+    ):
+        auth = await EcobeeAuth.login(outer_session, "user@example.com", "secret")
+
+    assert auth.refresh_token == "RT-prompt"
+    assert auth._access_token == "AT-prompt"
+
+
+@pytest.mark.asyncio
+async def test_full_login_e2e_with_mfa_prompt_chain():
+    """E2E login on a 2FA account: Auth0 chains /u/mfa-* between password and callback."""
+    chain = _routed_session(
+        get_responses=[
+            # /authorize -> /u/login/identifier
+            _redir("https://auth.ecobee.com/u/login/identifier?state=A"),
+            # /authorize/resume -> /u/mfa-otp-challenge
+            _redir("https://auth.ecobee.com/u/mfa-otp-challenge?state=MFA"),
+            # GET MFA prompt page
+            _html(200, "<html>mfa</html>"),
+            # second /authorize/resume -> callback
+            _redir(
+                "https://www.ecobee.com/home/authCallback?code=MFA-C&state=ST"
+            ),
+        ],
+        post_responses=[
+            # /u/login/identifier -> /u/login/password
+            _redir("https://auth.ecobee.com/u/login/password?state=B"),
+            # /u/login/password -> /authorize/resume
+            _redir("https://auth.ecobee.com/authorize/resume?state=C"),
+            # POST MFA prompt -> /authorize/resume
+            _redir("https://auth.ecobee.com/authorize/resume?state=D"),
+            # /oauth/token
+            _token_resp(
+                200,
+                {
+                    "access_token": "AT-mfa",
+                    "refresh_token": "RT-mfa",
+                    "expires_in": 3600,
+                },
+            ),
+        ],
+    )
+    outer_session = MagicMock()
+    chain_cm = MagicMock()
+    chain_cm.__aenter__ = AsyncMock(return_value=chain)
+    chain_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with patch(
+        "custom_components.ecobee.auth.aiohttp.ClientSession",
+        return_value=chain_cm,
+    ):
+        auth = await EcobeeAuth.login(outer_session, "user@example.com", "secret")
+
+    assert auth.refresh_token == "RT-mfa"
+
+
+@pytest.mark.asyncio
+async def test_login_no_refresh_token_in_response_raises_runtime():
+    """A 200 token response without refresh_token = wrong scope; surface clearly."""
+    chain = _routed_session(
+        get_responses=[
+            _redir("https://auth.ecobee.com/u/login/identifier?state=A"),
+            _redir(
+                "https://www.ecobee.com/home/authCallback?code=CODE&state=ST"
+            ),
+        ],
+        post_responses=[
+            _redir("https://auth.ecobee.com/u/login/password?state=B"),
+            _redir("https://auth.ecobee.com/authorize/resume?state=C"),
+            _token_resp(200, {"access_token": "AT-only", "expires_in": 3600}),
+        ],
+    )
+    outer_session = MagicMock()
+    chain_cm = MagicMock()
+    chain_cm.__aenter__ = AsyncMock(return_value=chain)
+    chain_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with patch(
+        "custom_components.ecobee.auth.aiohttp.ClientSession",
+        return_value=chain_cm,
+    ):
+        with pytest.raises(RuntimeError):
+            await EcobeeAuth.login(outer_session, "u@e.com", "x")
+
+
+@pytest.mark.asyncio
+async def test_login_invalid_credentials_raises_at_password_step():
+    """Bad password = Auth0 returns 400 with data-error-code at /u/login/password."""
+    bad_pw = MagicMock()
+    bad_pw.status = 400
+    bad_pw.headers = {}
+    bad_pw.text = AsyncMock(
+        return_value=(
+            '<html><span data-error-code="invalid_password">Wrong</span></html>'
+        )
+    )
+    chain = _routed_session(
+        get_responses=[
+            _redir("https://auth.ecobee.com/u/login/identifier?state=A"),
+        ],
+        post_responses=[
+            _redir("https://auth.ecobee.com/u/login/password?state=B"),
+            bad_pw,
+        ],
+    )
+    outer_session = MagicMock()
+    chain_cm = MagicMock()
+    chain_cm.__aenter__ = AsyncMock(return_value=chain)
+    chain_cm.__aexit__ = AsyncMock(return_value=None)
+
+    with patch(
+        "custom_components.ecobee.auth.aiohttp.ClientSession",
+        return_value=chain_cm,
+    ):
+        with pytest.raises(InvalidCredentialsError):
+            await EcobeeAuth.login(outer_session, "u@e.com", "wrong")

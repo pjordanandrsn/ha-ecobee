@@ -1,60 +1,96 @@
-"""Resource Owner Password Grant (ROPG) auth against ecobee's Auth0 tenant.
+"""Auth0 Authorization Code + PKCE + universal-login against ecobee's tenant.
 
-Why ROPG (and not the proper code-flow + PIN dance the core integration
-uses): ecobee shut down public dev-portal API-key registration in 2024,
-so a new user can no longer create an API key to drive the core HA
-integration. ROPG against the public web-app client_id mirrors what
-ecobee.com itself does when you sign in there; the bash project
-``r00k/ecobee-cli`` proved this works without an API key.
+v0.3 replaces v0.2's Resource Owner Password Grant. Why the change:
 
-This is much simpler than the parallel Generac fork's auth.py: no DPoP,
-no universal-login HTML scraping, no PKCE. Just two POSTs to
-``/oauth/token`` (one for password grant, one for refresh).
+* ecobee's web client config rejects ROPG MFA grants outright. Verified
+  live 2026-05-03: Auth0 returns ``unauthorized_client`` for both
+  ``mfa-otp`` and ``mfa-oob`` grant types regardless of the configured
+  factor, so any 2FA-enabled account is fundamentally unreachable via
+  ROPG. The same client config DOES allow the standard authorization-
+  code flow with PKCE, and Auth0's universal-login pages handle MFA
+  natively (a 2FA-enabled login simply chains through ``/u/mfa-*``
+  pages between ``/u/login/password`` and ``/authorize/resume``).
+* By using universal-login, MFA becomes Auth0's problem — we don't
+  enumerate factors, fire challenges, or submit codes; the user
+  interacts with Auth0's hosted pages via redirects we follow. The
+  ``_handle_custom_prompt`` helper handles all the in-between
+  ``/u/mfa-*`` and ``/u/custom-prompt/<id>`` pages generically.
 
-For MFA-enabled accounts (v0.2 and later), the password grant returns
-403 mfa_required + an mfa_token JWT. We then enumerate the user's
-second-factor authenticators (/mfa/authenticators), prompt for a code
-through the config flow, and re-POST /oauth/token with one of the
-Auth0 MFA grant types (mfa-otp or mfa-oob) plus the code. The resulting
-refresh_token works for unattended refreshes forever after — MFA is
-verified once at config-entry creation, never again.
+Differences vs the parallel Generac fork (which uses the same flow
+against the same Auth0 tenant):
 
-Persistence pattern: ``set_refresh_token_persist_callback`` lets the
-caller (``__init__.py``) hook into Auth0 token rotation and write the
-new RT back into the ConfigEntry. The same async-Lock + double-check
-pattern as the Generac fork prevents concurrent refresh storms.
+* No DPoP. ecobee's web client doesn't enforce DPoP — Bearer tokens
+  are accepted on every API call. This strips the entire ES256
+  keypair / JWK thumbprint / DPoP-Nonce dance.
+* The redirect URI is the web callback (``https://www.ecobee.com/home
+  /authCallback``) rather than a deep-link URI scheme. We never
+  navigate to it; we parse ``?code=...&state=...`` from the
+  ``Location`` header on the eventual 302.
+* Persisted credential is ``{email, refresh_token}``; no ``dpop_pem``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import json
 import logging
+import re
+import secrets
 import time
+import urllib.parse
 from typing import Awaitable, Callable, Optional
 
 import aiohttp
 
 from .const import (
-    AUTH_AUDIENCE,
-    AUTH_SCOPE,
-    AUTH_URL,
-    GRANT_TYPE_MFA_OOB,
-    GRANT_TYPE_MFA_OTP,
-    MFA_AUTHENTICATORS_URL,
-    MFA_CHALLENGE_URL,
-    MFA_TYPE_OOB,
-    MFA_TYPE_OTP,
+    AUDIENCE,
+    AUTHORIZE_URL,
+    IDENTIFIER_URL,
+    PASSWORD_URL,
+    REDIRECT_URI,
+    RESUME_URL,
+    SCOPES,
+    TOKEN_URL,
     WEB_CLIENT_ID,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
+AUTH0_DOMAIN = "auth.ecobee.com"
+
+# Standard browser UA — ecobee's web flow expects a browser-shaped
+# request. Auth0's universal-login pages care about Accept + UA enough
+# that an obvious bot UA can land you on a different render path.
+USER_AGENT_WEB = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "Version/18.0 Safari/605.1.15"
+)
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _make_pkce() -> tuple[str, str]:
+    """Return (code_verifier, code_challenge) per RFC 7636 S256.
+
+    PKCE is mandatory for Auth0 authorization-code flow with public
+    clients. The verifier is opaque random bytes; the challenge is
+    SHA-256 of the verifier, base64url-encoded.
+    """
+    verifier = _b64url(secrets.token_bytes(32))
+    challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
+    return verifier, challenge
+
 
 class InvalidGrantError(Exception):
     """Raised when the refresh token has been invalidated server-side.
 
-    The caller should map this to ``ConfigEntryAuthFailed`` so HA prompts
-    the user to re-authenticate.
+    The caller should map this to ``ConfigEntryAuthFailed`` so HA
+    prompts the user to re-authenticate.
     """
 
 
@@ -62,73 +98,368 @@ class InvalidCredentialsError(Exception):
     """Raised when the user-supplied email/password is rejected at login."""
 
 
-class MFANotSupportedError(Exception):
-    """Raised when the account's MFA factor type cannot be handled.
+# ---------------------------------------------------------------------------
+# Login flow (one-shot, runs from the config flow when user submits creds)
+# ---------------------------------------------------------------------------
 
-    v0.2 wires OTP (authenticator app) + OOB SMS. Push-notification
-    factors are recognised but rejected with this error so the user
-    knows it isn't a generic auth bug. They can fall back to
-    authenticator-app or SMS in the meantime, or wait for push support
-    to land.
+
+async def _authorize(
+    session: aiohttp.ClientSession, state: str, challenge: str
+) -> str:
+    """GET /authorize and follow the first 302 to /u/login/identifier.
+
+    Returns the ``state`` parameter from the redirect — Auth0 binds
+    each /u/login/* round-trip to a per-session state token, which we
+    thread through every subsequent request.
     """
+    params = {
+        "response_type": "code",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "redirect_uri": REDIRECT_URI,
+        "scope": SCOPES,
+        "audience": AUDIENCE,
+        "state": state,
+        "client_id": WEB_CLIENT_ID,
+        "prompt": "login",
+    }
+    headers = {"User-Agent": USER_AGENT_WEB, "Accept": "text/html,*/*"}
+    async with session.get(
+        AUTHORIZE_URL, params=params, headers=headers, allow_redirects=False
+    ) as resp:
+        if resp.status not in (302, 303):
+            body = (await resp.text())[:200]
+            raise RuntimeError(
+                f"step=authorize: expected 302/303, got {resp.status}; body={body!r}"
+            )
+        loc = resp.headers["Location"]
+    _LOGGER.warning("Ecobee auth: step=authorize -> 302 loc=%s", loc[:200])
+    qs = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)
+    if "state" not in qs:
+        raise RuntimeError(f"step=authorize: no state in redirect loc={loc!r}")
+    return qs["state"][0]
 
 
-class MFARequiredError(Exception):
-    """Raised by ``EcobeeAuth.login`` when the account has 2FA enabled.
+async def _post_login_form(
+    session: aiohttp.ClientSession, url: str, state: str, form: dict
+) -> str:
+    """POST a /u/login/* form. Return the redirect ``Location`` on success."""
+    headers = {
+        "User-Agent": USER_AGENT_WEB,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "text/html,*/*",
+        "Origin": f"https://{AUTH0_DOMAIN}",
+        "Referer": f"{url}?state={state}",
+    }
+    body = urllib.parse.urlencode(form)
+    async with session.post(
+        url,
+        params={"state": state},
+        data=body,
+        headers=headers,
+        allow_redirects=False,
+    ) as resp:
+        if resp.status not in (302, 303):
+            text = await resp.text()
+            # Auth0 ULP renders field-level errors as
+            #   class="ulp-input-error-message" data-error-code="<code>"
+            # Surface the first code so the user sees a meaningful
+            # reason instead of a bare HTTP 400.
+            m = re.search(r'data-error-code="([^"]+)"', text)
+            code = m.group(1) if m else None
+            _LOGGER.warning(
+                "POST %s -> %s; auth0 error code=%s", url, resp.status, code
+            )
+            if code:
+                if any(
+                    s in code.lower()
+                    for s in ("password", "credential", "user", "lock", "blocked")
+                ):
+                    raise InvalidCredentialsError(f"login rejected ({code})")
+                raise RuntimeError(
+                    f"step=login_form url={url} status={resp.status} auth0_code={code}"
+                )
+            raise RuntimeError(
+                f"step=login_form url={url} status={resp.status} no_code body={text[:200]!r}"
+            )
+        return resp.headers["Location"]
 
-    Carries the short-lived ``mfa_token`` JWT returned by Auth0 and
-    (after enrichment by ``list_mfa_authenticators``) the list of
-    configured authenticators. The config flow catches this, prompts
-    the user for a second-factor code, and calls back into
-    ``submit_mfa`` to complete the grant.
+
+async def _identifier_step(
+    session: aiohttp.ClientSession, state: str, email: str
+) -> str:
+    """POST /u/login/identifier with the email; advance to /u/login/password."""
+    form = {
+        "state": state,
+        "username": email,
+        "js-available": "true",
+        "webauthn-available": "true",
+        "is-brave": "false",
+        "webauthn-platform-available": "true",
+        "action": "default",
+    }
+    loc = await _post_login_form(session, IDENTIFIER_URL, state, form)
+    _LOGGER.warning("Ecobee auth: step=identifier -> loc=%s", loc[:200])
+    parsed = urllib.parse.urlparse(loc)
+    if not parsed.path.endswith("/u/login/password"):
+        # Auth0 sends us back to /u/login/identifier when the email is
+        # not recognized; surface that as bad credentials.
+        raise InvalidCredentialsError("email not recognized")
+    return urllib.parse.parse_qs(parsed.query)["state"][0]
+
+
+async def _password_step(
+    session: aiohttp.ClientSession, state: str, email: str, password: str
+) -> str:
+    """POST /u/login/password; advance to /authorize/resume."""
+    form = {
+        "state": state,
+        "username": email,
+        "password": password,
+        "action": "default",
+    }
+    loc = await _post_login_form(session, PASSWORD_URL, state, form)
+    _LOGGER.warning("Ecobee auth: step=password -> loc=%s", loc[:200])
+    parsed = urllib.parse.urlparse(loc)
+    if not parsed.path.endswith("/authorize/resume"):
+        raise InvalidCredentialsError(f"step=password: rejected loc={loc!r}")
+    return urllib.parse.parse_qs(parsed.query)["state"][0]
+
+
+async def _resume_to_code(session: aiohttp.ClientSession, resume_state: str) -> str:
+    """GET /authorize/resume?state=… and turn the eventual web callback into a code.
+
+    Loops up to 5 times to handle Auth0 prompt redirects (T&C updates,
+    cookie consent, MFA challenges, profile completion, etc.) that
+    chain between password submit and the final code redirect. Each
+    such prompt presents as a /u/* redirect after password — we fetch
+    the page, post back the form, and recurse on the new resume state.
+    Loop bound prevents infinite redirect storms if a prompt can't be
+    auto-handled.
+
+    The bound is higher than Generac's (5 vs 3) because MFA flows can
+    chain identifier -> password -> mfa-detect -> mfa-otp-challenge ->
+    custom-prompt before reaching the callback, so 3 was occasionally
+    too tight on 2FA-enabled accounts.
     """
+    headers = {"User-Agent": USER_AGENT_WEB, "Accept": "text/html,*/*"}
+    for attempt in range(5):
+        async with session.get(
+            RESUME_URL,
+            params={"state": resume_state},
+            headers=headers,
+            allow_redirects=False,
+        ) as resp:
+            if resp.status not in (302, 303):
+                body = (await resp.text())[:200]
+                raise RuntimeError(
+                    f"step=resume: expected 302/303, got {resp.status}; body={body!r}"
+                )
+            loc = resp.headers["Location"]
+        _LOGGER.warning("Ecobee auth: step=resume -> loc=%s", loc[:200])
 
-    def __init__(
-        self,
-        mfa_token: str,
-        authenticators: Optional[list[dict]] = None,
-    ) -> None:
-        super().__init__("MFA required")
-        self.mfa_token = mfa_token
-        # Populated by the caller after list_mfa_authenticators(); we
-        # accept it here so the exception object can be a single
-        # carrier through the config flow without needing a separate
-        # pre-fetch step.
-        self.authenticators: list[dict] = authenticators or []
+        # Final destination: the web callback URL with ?code=&state=.
+        # We never actually navigate to the callback — we just lift
+        # the code out of the Location header.
+        if loc.startswith(REDIRECT_URI) or loc.startswith(
+            "https://www.ecobee.com/home/authCallback"
+        ):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)
+            if "code" not in qs:
+                raise RuntimeError(f"step=resume: no code in redirect loc={loc!r}")
+            return qs["code"][0]
+
+        # Any /u/* path (custom-prompt, mfa-detect, mfa-otp-challenge,
+        # mfa-push-challenge-push, consent, etc.) goes through the same
+        # generic prompt handler — it POSTs ``state=<state>&action=default``
+        # which works for primary-button "Continue / Confirm / Submit"
+        # actions across Auth0's universal-login surface.
+        if "/u/" in loc:
+            resume_state = await _handle_custom_prompt(session, loc)
+            continue
+
+        raise RuntimeError(f"step=resume: unexpected scheme loc={loc!r}")
+
+    raise RuntimeError(
+        "step=resume: 5 consecutive Auth0 prompts without reaching the "
+        "callback redirect. Sign in to https://www.ecobee.com from a "
+        "browser, complete any pending prompts (T&C, MFA setup, "
+        "profile completion), then retry the integration setup."
+    )
 
 
-class MFAInvalidCodeError(Exception):
-    """Raised when the user-supplied OTP / SMS code is wrong.
+async def _handle_custom_prompt(session: aiohttp.ClientSession, loc: str) -> str:
+    """POST an Auth0 /u/* prompt page back to itself; return next resume state.
 
-    Distinct from the ``mfa_token`` having expired (see
-    ``MFAExpiredError``) so the config flow can keep the user on the
-    same MFA-code form for a retry instead of restarting from password.
+    Auth0 universal-login pages are React-rendered — the visible form
+    is hydrated client-side from JSON in a ``<script>`` tag, so static
+    HTML parsing can't find a ``<form>`` tag. We bypass parsing
+    entirely: the POST endpoint is always the same path the GET
+    landed on, and the body is always ``state=<state>&action=default``
+    for the primary button (Auth0's universal convention — confirmed
+    via the auth0 universal-login source).
+
+    The same handler covers every Auth0 prompt page we might encounter
+    during login: ``/u/custom-prompt/<id>`` (T&C, profile completion),
+    ``/u/mfa-detect``, ``/u/mfa-otp-challenge``, ``/u/mfa-push-*``,
+    etc. For pages that need genuine user input (entering an OTP code
+    in an external prompt), the POST will return 200 with the page
+    again instead of a 302 — we surface that as an actionable error.
+    Note: in this integration's MFA flow, the 6-digit OTP code IS the
+    user input; the user enters it on Auth0's hosted page during the
+    redirect chain, not in our config-flow form.
     """
+    abs_url = (
+        loc if loc.startswith("http") else f"https://{AUTH0_DOMAIN}{loc}"
+    )
+    parsed = urllib.parse.urlparse(abs_url)
+    qs = urllib.parse.parse_qs(parsed.query)
+    state = qs.get("state", [""])[0]
+    if not state:
+        raise RuntimeError(f"step=custom-prompt: no state in url={abs_url!r}")
+
+    # Fetch the page to inspect the embedded prompt config. Auth0
+    # universal-login pages ship the React props as JSON inside a
+    # <script id="__NEXT_DATA__"> tag — the prompt name + required
+    # form fields are in there. We log the relevant bits so a failing
+    # POST below has actionable diagnostics in the trace.
+    headers_get = {"User-Agent": USER_AGENT_WEB, "Accept": "text/html,*/*"}
+    async with session.get(abs_url, headers=headers_get, allow_redirects=False) as resp:
+        page = await resp.text() if resp.status == 200 else ""
+    nd = re.search(
+        r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>',
+        page, re.DOTALL,
+    )
+    if nd:
+        try:
+            nd_json = json.loads(nd.group(1))
+            prompt_blob = (
+                nd_json.get("props", {}).get("pageProps", {}).get("prompt")
+                or nd_json.get("prompt")
+            )
+            _LOGGER.warning(
+                "Ecobee auth: step=custom-prompt config=%s",
+                json.dumps(prompt_blob)[:1500] if prompt_blob else "(no prompt key)",
+            )
+        except (json.JSONDecodeError, KeyError, AttributeError) as e:
+            _LOGGER.warning(
+                "Ecobee auth: step=custom-prompt __NEXT_DATA__ parse failed: %s; "
+                "raw[:500]=%r", e, nd.group(1)[:500],
+            )
+    else:
+        # Auth0 Forms (the post-2024 form-builder feature, distinguished
+        # by .af-custom-form-container CSS classes) embeds its JSON in
+        # `window.universal_login_context = {...};` rather than
+        # __NEXT_DATA__. Pull that out if present.
+        ulc = re.search(
+            r'window\.universal_login_context\s*=\s*(\{.*?\});\s*<',
+            page, re.DOTALL,
+        )
+        if ulc:
+            try:
+                ulc_json = json.loads(ulc.group(1))
+                _LOGGER.warning(
+                    "Ecobee auth: step=custom-prompt ulc=%s",
+                    json.dumps(ulc_json)[:3000],
+                )
+            except json.JSONDecodeError as e:
+                _LOGGER.warning(
+                    "Ecobee auth: step=custom-prompt ulc parse failed: %s; "
+                    "raw[:1000]=%r", e, ulc.group(1)[:1000],
+                )
+        else:
+            _LOGGER.warning(
+                "Ecobee auth: step=custom-prompt no embedded JSON; "
+                "page[:3000]=%r", page[:3000],
+            )
+
+    headers_post = {
+        "User-Agent": USER_AGENT_WEB,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "text/html,*/*",
+        "Origin": f"https://{AUTH0_DOMAIN}",
+        "Referer": abs_url,
+    }
+    body = {"state": state, "action": "default"}
+    async with session.post(
+        abs_url, data=body, headers=headers_post, allow_redirects=False,
+    ) as resp:
+        status = resp.status
+        if status not in (302, 303):
+            page = (await resp.text())[:300]
+            raise RuntimeError(
+                f"step=custom-prompt: POST {abs_url[:120]} -> {status} "
+                f"(expected 302/303). The prompt requires interactive "
+                f"action (most likely email verification, MFA setup, or "
+                f"profile completion). Sign in to https://www.ecobee.com "
+                f"from a browser, complete any pending step shown there, "
+                f"then retry the HA integration setup. Page snippet: {page!r}"
+            )
+        new_loc = resp.headers["Location"]
+    _LOGGER.warning(
+        "Ecobee auth: step=custom-prompt POST -> %d loc=%s",
+        status, new_loc[:200],
+    )
+
+    # Most prompts redirect to /authorize/resume?state=<new>; some
+    # chain to another /u/* page — the caller's loop handles that case
+    # (we just return whatever state we found here).
+    parsed_new = urllib.parse.urlparse(new_loc)
+    if parsed_new.path.endswith("/authorize/resume"):
+        new_qs = urllib.parse.parse_qs(parsed_new.query)
+        if "state" not in new_qs:
+            raise RuntimeError(f"step=custom-prompt: no state in loc={new_loc!r}")
+        return new_qs["state"][0]
+    if "/u/" in new_loc:
+        chained_state = urllib.parse.parse_qs(parsed_new.query).get("state", [""])[0]
+        if not chained_state:
+            raise RuntimeError(
+                f"step=custom-prompt: chained prompt has no state: {new_loc!r}"
+            )
+        return chained_state
+    raise RuntimeError(
+        f"step=custom-prompt: unexpected redirect target loc={new_loc!r}"
+    )
 
 
-class MFAExpiredError(Exception):
-    """Raised when the ``mfa_token`` is no longer valid.
+async def _exchange_code(
+    session: aiohttp.ClientSession, code: str, verifier: str
+) -> dict:
+    """POST /oauth/token grant_type=authorization_code; return token payload."""
+    body = {
+        "grant_type": "authorization_code",
+        "client_id": WEB_CLIENT_ID,
+        "code": code,
+        "code_verifier": verifier,
+        "redirect_uri": REDIRECT_URI,
+    }
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+    }
+    async with session.post(TOKEN_URL, data=body, headers=headers) as resp:
+        text = await resp.text()
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            payload = {"raw": text}
+        if resp.status == 200:
+            return payload
+        raise RuntimeError(
+            f"code exchange failed: {resp.status} {payload}"
+        )
 
-    Auth0 mfa_tokens live ~10 minutes. When this fires the config flow
-    must restart from the email/password step — the user has to log in
-    again to get a fresh mfa_token before they can submit a code.
-    """
 
-
-class MFARateLimitedError(Exception):
-    """Raised when Auth0 blocks further MFA submits (429 too_many_attempts).
-
-    The user has burned their attempt allowance and must wait (Auth0's
-    default lockout is several minutes; the precise duration isn't
-    surfaced in the response).
-    """
+# ---------------------------------------------------------------------------
+# EcobeeAuth — the main reusable handle
+# ---------------------------------------------------------------------------
 
 
 class EcobeeAuth:
     """Holds the long-lived refresh token and mints fresh access tokens.
 
-    Instances are reused across the lifetime of a ConfigEntry. The same
-    aiohttp session is reused for token + API calls.
+    Instances are reused across the lifetime of a ConfigEntry. The
+    same aiohttp session is reused for token + API calls.
     """
 
     # Refresh slightly before expiry so callers always see a fresh token.
@@ -156,8 +487,8 @@ class EcobeeAuth:
 
         The callback receives the new refresh token and is responsible
         for persisting it (typically into the ConfigEntry's ``data``
-        dict). Auth0 may or may not rotate on each refresh depending on
-        tenant configuration; we handle both cases.
+        dict). Auth0 may or may not rotate on each refresh depending
+        on tenant configuration; we handle both cases.
         """
         self._rt_persist_cb = cb
 
@@ -165,315 +496,49 @@ class EcobeeAuth:
     async def login(
         cls, session: aiohttp.ClientSession, email: str, password: str
     ) -> "EcobeeAuth":
-        """Run ROPG and return a ready instance.
+        """Run the full Auth0 universal-login flow and return a ready instance.
+
+        The Auth0 universal-login flow is stateful: /authorize sets a
+        session cookie that /u/login/identifier and /u/login/password
+        require. We use a dedicated cookie-jar-backed session for the
+        login flow only; the caller's long-lived ``session`` is reused
+        afterward for refresh-token rotation, which doesn't depend on
+        cookies.
 
         Raises:
-            InvalidCredentialsError: bad email/password.
-            MFARequiredError: account has 2FA enabled. ``mfa_token`` and
-                ``authenticators`` are populated; caller should branch
-                to the MFA challenge / submit dance.
-            RuntimeError: any other unexpected response.
+            InvalidCredentialsError: bad email or password rejected at
+                /u/login/identifier or /u/login/password.
+            RuntimeError: any other unexpected step failure (network,
+                Auth0 redirect chain breakage, etc.).
         """
-        body = {
-            "grant_type": "password",
-            "username": email,
-            "password": password,
-            "client_id": WEB_CLIENT_ID,
-            "audience": AUTH_AUDIENCE,
-            "scope": AUTH_SCOPE,
-        }
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-        }
-        async with session.post(AUTH_URL, data=body, headers=headers) as resp:
-            status = resp.status
-            try:
-                payload = await resp.json(content_type=None)
-            except (aiohttp.ContentTypeError, ValueError):
-                payload = {"raw": (await resp.text())[:200]}
+        verifier, challenge = _make_pkce()
+        state = _b64url(secrets.token_bytes(32))
 
-        if status == 200:
-            return cls._auth_from_token_payload(session, payload, email=email)
-
-        # Map known Auth0 errors:
-        #   403 mfa_required + mfa_token=<jwt> -> MFARequiredError
-        #     (Auth0 standard shape per its "MFA in Resource Owner
-        #     Password Grant" doc — what ecobee uses for 2FA accounts.)
-        #   400 invalid_grant -> bad email/password
-        #   400 invalid_request + error_description mentions MFA/2FA
-        #     -> legacy phrasing kept for older Auth0 tenant configs;
-        #     no mfa_token is supplied so we can't continue from here.
-        if status in (400, 403):
-            mfa_required = await cls._maybe_initiate_mfa(
-                session, payload, email=email
+        jar = aiohttp.CookieJar(unsafe=True)
+        async with aiohttp.ClientSession(cookie_jar=jar) as login_session:
+            login_state = await _authorize(login_session, state, challenge)
+            pw_state = await _identifier_step(login_session, login_state, email)
+            resume_state = await _password_step(
+                login_session, pw_state, email, password
             )
-            if mfa_required is not None:
-                raise mfa_required
-            err = payload.get("error", "")
-            if err == "invalid_grant":
-                raise InvalidCredentialsError(
-                    payload.get("error_description") or "invalid email or password"
-                )
-        raise RuntimeError(f"login failed: status={status} payload={payload}")
+            code = await _resume_to_code(login_session, resume_state)
+            tokens = await _exchange_code(login_session, code, verifier)
 
-    @classmethod
-    async def _maybe_initiate_mfa(
-        cls,
-        session: aiohttp.ClientSession,
-        payload: dict,
-        *,
-        email: Optional[str] = None,
-    ) -> Optional[MFARequiredError]:
-        """Detect Auth0's MFA-required error and return an enriched typed error.
-
-        Returns ``None`` if the payload isn't an MFA challenge. When it
-        IS an MFA challenge with a real ``mfa_token``, we eagerly
-        enumerate the authenticators so the caller has everything it
-        needs to render the next form without a second round-trip.
-        """
-        err = (payload.get("error") or "").lower()
-        desc = (payload.get("error_description") or "").lower()
-        mfa_token = payload.get("mfa_token")
-
-        looks_like_mfa = (
-            err == "mfa_required"
-            or "mfa" in err
-            or "mfa" in desc
-            or "multifactor" in desc
-        )
-        if not looks_like_mfa:
-            return None
-
-        if not mfa_token:
-            # Older / misconfigured tenants surface MFA as 400
-            # invalid_request without an mfa_token. Without a token we
-            # can't continue, so surface the legacy "not supported"
-            # shape to keep behaviour consistent for users who hit it.
-            raise MFANotSupportedError(
-                "ecobee account has 2FA but the auth tenant did not "
-                "return an mfa_token; cannot complete MFA flow."
-            )
-
-        # Eagerly enumerate authenticators so the config flow has
-        # everything it needs. If this call fails we still raise
-        # MFARequiredError with an empty list — the flow will surface
-        # an "internal" error rather than crashing.
-        try:
-            authenticators = await cls._fetch_authenticators(session, mfa_token)
-        except Exception:  # noqa: BLE001
-            _LOGGER.exception("ecobee /mfa/authenticators enumeration failed")
-            authenticators = []
-        return MFARequiredError(mfa_token=mfa_token, authenticators=authenticators)
-
-    @staticmethod
-    async def _fetch_authenticators(
-        session: aiohttp.ClientSession, mfa_token: str
-    ) -> list[dict]:
-        """GET /mfa/authenticators -> normalized list of dicts.
-
-        Auth0 returns an array; we filter to ``active`` entries (an
-        inactive authenticator can't be used to satisfy the grant).
-        """
-        headers = {
-            "Authorization": f"Bearer {mfa_token}",
-            "Accept": "application/json",
-        }
-        async with session.get(MFA_AUTHENTICATORS_URL, headers=headers) as resp:
-            status = resp.status
-            try:
-                data = await resp.json(content_type=None)
-            except (aiohttp.ContentTypeError, ValueError):
-                data = []
-        if status != 200 or not isinstance(data, list):
-            raise RuntimeError(
-                f"/mfa/authenticators failed: status={status} body={data!r:.200}"
-            )
-        return [
-            a
-            for a in data
-            if isinstance(a, dict) and a.get("active", True) is not False
-        ]
-
-    @classmethod
-    async def list_mfa_authenticators(
-        cls, session: aiohttp.ClientSession, mfa_token: str
-    ) -> list[dict]:
-        """Public wrapper around the authenticators enumeration.
-
-        Useful when the config flow needs to re-fetch (e.g. user
-        backed out of the factor selection step and came back).
-        """
-        return await cls._fetch_authenticators(session, mfa_token)
-
-    @classmethod
-    async def challenge_mfa(
-        cls,
-        session: aiohttp.ClientSession,
-        *,
-        mfa_token: str,
-        authenticator_id: str,
-        authenticator_type: str,
-    ) -> Optional[dict]:
-        """Trigger an OOB challenge for SMS / push factors.
-
-        OTP (authenticator app) factors don't need a challenge call —
-        the user just reads the current 6-digit code from their app —
-        so this is a no-op for ``MFA_TYPE_OTP`` and returns ``None``.
-
-        For OOB factors (SMS / push), POST /mfa/challenge fires the
-        text message or push notification. We return the response dict
-        which contains ``oob_code`` (passed back to /oauth/token along
-        with the user's code) and ``binding_method``.
-        """
-        if authenticator_type == MFA_TYPE_OTP:
-            return None
-        body = {
-            "client_id": WEB_CLIENT_ID,
-            "mfa_token": mfa_token,
-            "challenge_type": "oob",
-            "authenticator_id": authenticator_id,
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-        async with session.post(MFA_CHALLENGE_URL, json=body, headers=headers) as resp:
-            status = resp.status
-            try:
-                payload = await resp.json(content_type=None)
-            except (aiohttp.ContentTypeError, ValueError):
-                payload = {"raw": (await resp.text())[:200]}
-        if status != 200:
-            raise RuntimeError(
-                f"/mfa/challenge failed: status={status} payload={payload}"
-            )
-        return payload
-
-    @classmethod
-    async def submit_mfa(
-        cls,
-        session: aiohttp.ClientSession,
-        *,
-        mfa_token: str,
-        authenticator_type: str,
-        code: str,
-        oob_code: Optional[str] = None,
-        email: Optional[str] = None,
-    ) -> "EcobeeAuth":
-        """Complete the MFA grant and return a ready EcobeeAuth handle.
-
-        For OTP, ``code`` is the 6-digit value from the user's
-        authenticator app. For OOB, ``code`` is the binding code from
-        the SMS / push prompt and ``oob_code`` is what
-        ``challenge_mfa`` returned.
-
-        Raises:
-            MFAInvalidCodeError: user typed the wrong code; flow should
-                re-prompt on the same form.
-            MFAExpiredError: ``mfa_token`` aged out (~10 min); flow
-                must restart at email/password.
-            MFARateLimitedError: too many bad attempts; user is
-                temporarily locked out by Auth0.
-            MFANotSupportedError: caller passed a factor type we don't
-                wire (currently ``push-notification``).
-            RuntimeError: any other unexpected response.
-        """
-        if authenticator_type == MFA_TYPE_OTP:
-            body = {
-                "grant_type": GRANT_TYPE_MFA_OTP,
-                "client_id": WEB_CLIENT_ID,
-                "mfa_token": mfa_token,
-                "otp": code,
-            }
-        elif authenticator_type == MFA_TYPE_OOB:
-            if not oob_code:
-                # Programmer error; OOB requires the oob_code from the
-                # /mfa/challenge response or the grant will 400.
-                raise RuntimeError("submit_mfa: OOB factor needs oob_code")
-            body = {
-                "grant_type": GRANT_TYPE_MFA_OOB,
-                "client_id": WEB_CLIENT_ID,
-                "mfa_token": mfa_token,
-                "oob_code": oob_code,
-                "binding_code": code,
-            }
-        else:
-            raise MFANotSupportedError(
-                f"MFA factor type '{authenticator_type}' is not yet "
-                "supported by this integration. Use an authenticator "
-                "app (OTP) or SMS instead."
-            )
-
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-        }
-        async with session.post(AUTH_URL, data=body, headers=headers) as resp:
-            status = resp.status
-            try:
-                payload = await resp.json(content_type=None)
-            except (aiohttp.ContentTypeError, ValueError):
-                payload = {"raw": (await resp.text())[:200]}
-
-        if status == 200:
-            return cls._auth_from_token_payload(session, payload, email=email)
-
-        if status == 429 or (payload.get("error") or "") == "too_many_attempts":
-            raise MFARateLimitedError(
-                payload.get("error_description")
-                or "Too many MFA attempts; wait a few minutes and try again."
-            )
-
-        if status == 403 and (payload.get("error") or "") == "invalid_grant":
-            desc = (payload.get("error_description") or "").lower()
-            if "expired" in desc or "expire" in desc:
-                raise MFAExpiredError(
-                    payload.get("error_description")
-                    or "MFA session expired; re-enter password to start over."
-                )
-            # Auth0's wrong-code message is "Invalid otp_code" or
-            # "Invalid binding_code" depending on grant type. Catch
-            # both with a substring match so wording shifts don't
-            # demote the typed error to RuntimeError.
-            if "invalid" in desc and ("otp" in desc or "binding" in desc or "code" in desc):
-                raise MFAInvalidCodeError(
-                    payload.get("error_description") or "Invalid code."
-                )
-            # Anything else 403/invalid_grant gets the generic typed
-            # error so the caller doesn't restart unnecessarily.
-            raise MFAInvalidCodeError(
-                payload.get("error_description") or "MFA code rejected."
-            )
-
-        raise RuntimeError(f"MFA submit failed: status={status} payload={payload}")
-
-    @classmethod
-    def _auth_from_token_payload(
-        cls,
-        session: aiohttp.ClientSession,
-        payload: dict,
-        *,
-        email: Optional[str] = None,
-    ) -> "EcobeeAuth":
-        """Build an EcobeeAuth from a /oauth/token 200 response.
-
-        Shared by the password grant (login) and the MFA grant
-        (submit_mfa) since both return the identical token shape.
-        """
-        refresh_token = payload.get("refresh_token")
+        refresh_token = tokens.get("refresh_token")
         if not refresh_token:
             raise RuntimeError(
-                "no refresh_token in token response (scope did not include offline_access?)"
+                "login: no refresh_token returned (scope did not include "
+                "offline_access?)"
             )
+
         auth = cls(session, refresh_token, email=email)
-        auth._access_token = payload["access_token"]
-        auth._access_token_exp = time.time() + int(payload.get("expires_in", 0))
+        auth._access_token = tokens["access_token"]
+        auth._access_token_exp = time.time() + int(tokens.get("expires_in", 0))
         _LOGGER.info(
-            "ecobee token grant OK: expires_in=%s scope=%s token_type=%s",
-            payload.get("expires_in"),
-            payload.get("scope"),
-            payload.get("token_type"),
+            "ecobee universal-login OK: expires_in=%s scope=%s token_type=%s",
+            tokens.get("expires_in"),
+            tokens.get("scope"),
+            tokens.get("token_type"),
         )
         return auth
 
@@ -526,12 +591,13 @@ class EcobeeAuth:
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
         }
-        async with self._session.post(AUTH_URL, data=body, headers=headers) as resp:
-            status = resp.status
+        async with self._session.post(TOKEN_URL, data=body, headers=headers) as resp:
+            text = await resp.text()
             try:
-                payload = await resp.json(content_type=None)
-            except (aiohttp.ContentTypeError, ValueError):
-                payload = {"raw": (await resp.text())[:200]}
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                payload = {"raw": text}
+            status = resp.status
 
         if status == 200:
             self._access_token = payload["access_token"]

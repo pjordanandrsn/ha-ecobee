@@ -3,9 +3,11 @@
 This integration shadows the Home Assistant core ``ecobee`` integration
 because HA loads ``custom_components/`` first. The bypass exists for one
 reason: ecobee shut down public dev-portal API-key registration in 2024,
-so the core integration's PIN/API-key flow can no longer be set up by new
-users. We use Resource Owner Password Grant (ROPG) against ecobee's
-Auth0 tenant with the public web client_id instead.
+so the core integration's PIN/API-key flow can no longer be set up by
+new users. v0.3 uses Auth0 Authorization Code flow with PKCE +
+universal-login against ecobee's Auth0 tenant — the same flow ecobee.com
+itself uses, which means MFA is handled natively by Auth0's hosted
+prompt pages (we just follow the redirect chain).
 """
 
 from homeassistant.const import Platform
@@ -14,35 +16,46 @@ DOMAIN = "ecobee"
 NAME = "Ecobee (Anderson fork)"
 MANUFACTURER = "ecobee"
 
-# Auth0 endpoints + the well-known public web-app client_id. This is the
-# same client_id the official ecobee web UI uses; pyecobee's
-# request_tokens_web() also targets it. Audience and scopes mirror what
-# the web UI requests; ``offline_access`` is added so we get a
-# refresh_token for long-running operation.
-AUTH_URL = "https://auth.ecobee.com/oauth/token"
+# Auth0 tenant + endpoints. Same tenant as the parallel Generac fork.
+AUTH0_DOMAIN = "auth.ecobee.com"
+
+# /authorize is the universal-login entry point. We GET it with the
+# PKCE challenge + state and follow the redirect to /u/login/identifier.
+AUTHORIZE_URL = f"https://{AUTH0_DOMAIN}/authorize"
+
+# /authorize/resume is what Auth0 redirects to after every /u/* prompt
+# step (login, MFA, T&C). It either chains to another /u/* page or
+# redirects to our REDIRECT_URI with the auth code.
+RESUME_URL = f"https://{AUTH0_DOMAIN}/authorize/resume"
+
+# /u/login/identifier accepts the email; /u/login/password accepts the
+# password. Both are POSTed with form-encoded bodies.
+IDENTIFIER_URL = f"https://{AUTH0_DOMAIN}/u/login/identifier"
+PASSWORD_URL = f"https://{AUTH0_DOMAIN}/u/login/password"
+
+# /oauth/token: code -> tokens, refresh_token -> tokens.
+TOKEN_URL = f"https://{AUTH0_DOMAIN}/oauth/token"
+
+# The web-app callback URL. Auth0 redirects here with ?code=&state=
+# after a successful login. We never actually navigate to it — we just
+# parse the params from the Location header on the final 302.
+REDIRECT_URI = "https://www.ecobee.com/home/authCallback"
+
+# The public web-app client_id. Same one pyecobee's
+# request_tokens_web() targets and that ecobee.com itself ships in
+# plain JS. No client_secret is needed for an Auth0 public client doing
+# authorization-code + PKCE.
 WEB_CLIENT_ID = "183eORFPlXyz9BbDZwqexHPBQoVjgadh"
-AUTH_AUDIENCE = "https://prod.ecobee.com/api/v1"
-AUTH_SCOPE = "openid smartRead smartWrite piiRead piiWrite offline_access"
 
-# Auth0 MFA endpoints (used when ROPG returns 403 mfa_required). The
-# /mfa/authenticators endpoint enumerates configured second factors;
-# /mfa/challenge fires an SMS / push prompt for OOB factors. OTP factors
-# (TOTP / authenticator app) need no challenge call — the user just
-# reads the current code from their app.
-MFA_AUTHENTICATORS_URL = "https://auth.ecobee.com/mfa/authenticators"
-MFA_CHALLENGE_URL = "https://auth.ecobee.com/mfa/challenge"
+# Audience claim: what Auth0 audits the access_token against. The REST
+# API base URL (api.ecobee.com/1) is different from the audience —
+# don't confuse them.
+AUDIENCE = "https://prod.ecobee.com/api/v1"
 
-# Auth0 MFA grant-type strings (Auth0-namespaced URLs, not opaque
-# identifiers). These go in the grant_type form field on the token
-# endpoint after the user supplies their second-factor code.
-GRANT_TYPE_MFA_OTP = "http://auth0.com/oauth/grant-type/mfa-otp"
-GRANT_TYPE_MFA_OOB = "http://auth0.com/oauth/grant-type/mfa-oob"
-
-# Authenticator type strings as returned by /mfa/authenticators. Used
-# to branch between OTP (no challenge) and OOB (needs challenge call).
-MFA_TYPE_OTP = "otp"
-MFA_TYPE_OOB = "oob"
-MFA_TYPE_PUSH = "push-notification"
+# Scopes requested at /authorize. ``offline_access`` is what makes
+# Auth0 issue a refresh_token; without it we'd need to interactively
+# re-login on every access-token expiry.
+SCOPES = "openid smartRead smartWrite piiRead piiWrite offline_access"
 
 # REST API endpoints. ecobee's API is HTTPS + Bearer auth.
 API_BASE = "https://api.ecobee.com/1"

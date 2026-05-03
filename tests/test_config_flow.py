@@ -1,17 +1,11 @@
-"""Tests for the ecobee config flow (initial setup + reauth + MFA)."""
+"""Tests for the v0.3 ecobee config flow (single-step universal-login + reauth)."""
 
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from custom_components.ecobee.auth import (
-    InvalidCredentialsError,
-    MFAExpiredError,
-    MFAInvalidCodeError,
-    MFANotSupportedError,
-    MFARequiredError,
-)
+from custom_components.ecobee.auth import InvalidCredentialsError
 from custom_components.ecobee.const import (
     CONF_PASSWORD,
     CONF_REFRESH_TOKEN,
@@ -28,25 +22,6 @@ def _mock_auth(refresh_token: str = "rt-abc", email: str = "user@example.com"):
     auth.refresh_token = refresh_token
     auth.email = email
     return auth
-
-
-def _otp_factor(fid: str = "totp|abc", name: str = "Authenticator app") -> dict:
-    return {
-        "id": fid,
-        "authenticator_type": "otp",
-        "name": name,
-        "active": True,
-    }
-
-
-def _sms_factor(fid: str = "sms|xyz", name: str = "XXX-XXX-1234") -> dict:
-    return {
-        "id": fid,
-        "authenticator_type": "oob",
-        "oob_channel": "sms",
-        "name": name,
-        "active": True,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -105,31 +80,6 @@ async def test_form_invalid_credentials(hass: HomeAssistant) -> None:
     assert result2["errors"] == {"base": "auth"}
 
 
-async def test_form_mfa_unsupported_surfaces_dedicated_error(hass: HomeAssistant) -> None:
-    """When MFA is signalled but the factor type can't be wired, surface mfa_unsupported.
-
-    This used to be the 'no MFA support at all' branch; now it covers
-    legitimately-unsupported factor types (push) or tenants that say
-    MFA is required without giving us an mfa_token to continue with.
-    """
-    await setup.async_setup_component(hass, "persistent_notification", {})
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN, context={"source": config_entries.SOURCE_USER}
-    )
-
-    with patch(
-        "custom_components.ecobee.config_flow.EcobeeAuth.login",
-        AsyncMock(side_effect=MFANotSupportedError("push only")),
-    ):
-        result2 = await hass.config_entries.flow.async_configure(
-            result["flow_id"],
-            {CONF_USERNAME: "u@e.com", CONF_PASSWORD: "x"},
-        )
-
-    assert result2["type"] == "form"
-    assert result2["errors"] == {"base": "mfa_unsupported"}
-
-
 async def test_form_internal_error(hass: HomeAssistant) -> None:
     """An unexpected exception surfaces as 'internal'."""
     await setup.async_setup_component(hass, "persistent_notification", {})
@@ -139,7 +89,7 @@ async def test_form_internal_error(hass: HomeAssistant) -> None:
 
     with patch(
         "custom_components.ecobee.config_flow.EcobeeAuth.login",
-        AsyncMock(side_effect=RuntimeError("boom")),
+        AsyncMock(side_effect=Exception("boom")),
     ):
         result2 = await hass.config_entries.flow.async_configure(
             result["flow_id"],
@@ -148,6 +98,59 @@ async def test_form_internal_error(hass: HomeAssistant) -> None:
 
     assert result2["type"] == "form"
     assert result2["errors"] == {"base": "internal"}
+
+
+@pytest.mark.parametrize(
+    "exception_msg, expected_error",
+    [
+        ("step=authorize: no state in redirect", "auth0_step_authorize"),
+        ("step=login_form url=... status=500 no_code", "auth0_step_login_form"),
+        ("step=resume: unexpected scheme", "auth0_step_resume"),
+        ("step=custom-prompt: POST returned 200", "auth0_step_custom_prompt"),
+        ("code exchange failed: 400 ...", "code_exchange"),
+        ("login: no state in redirect", "auth0_redirect"),
+    ],
+)
+async def test_form_auth0_step_errors_classified(
+    hass: HomeAssistant, exception_msg: str, expected_error: str
+) -> None:
+    """RuntimeErrors from auth.py get classified by step= tag."""
+    await setup.async_setup_component(hass, "persistent_notification", {})
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    with patch(
+        "custom_components.ecobee.config_flow.EcobeeAuth.login",
+        AsyncMock(side_effect=RuntimeError(exception_msg)),
+    ):
+        result2 = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {CONF_USERNAME: "u@e.com", CONF_PASSWORD: "any"},
+        )
+    assert result2["type"] == "form"
+    assert result2["errors"] == {"base": expected_error}
+
+
+async def test_form_auth0_unreachable(hass: HomeAssistant) -> None:
+    """ClientConnectorError surfaces as auth0_unreachable."""
+    import aiohttp
+    await setup.async_setup_component(hass, "persistent_notification", {})
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    err = aiohttp.ClientConnectorError(
+        connection_key=MagicMock(), os_error=OSError("dns fail")
+    )
+    with patch(
+        "custom_components.ecobee.config_flow.EcobeeAuth.login",
+        AsyncMock(side_effect=err),
+    ):
+        result2 = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {CONF_USERNAME: "u@e.com", CONF_PASSWORD: "any"},
+        )
+    assert result2["type"] == "form"
+    assert result2["errors"] == {"base": "auth0_unreachable"}
 
 
 async def test_duplicate_entry_aborts(hass: HomeAssistant) -> None:
@@ -178,7 +181,7 @@ async def test_duplicate_entry_aborts(hass: HomeAssistant) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Reauth flow
+# Reauth flow (single step — same as user step)
 # ---------------------------------------------------------------------------
 
 
@@ -250,7 +253,6 @@ async def test_reauth_locks_email_to_entry_unique_id(hass: HomeAssistant) -> Non
         )
         await hass.async_block_till_done()
 
-    # login() should have been invoked with the entry's stored email.
     assert login_mock.await_count == 1
     args = login_mock.await_args.args
     kwargs = login_mock.await_args.kwargs
@@ -287,7 +289,6 @@ async def test_reauth_invalid_credentials_shows_form_error(hass: HomeAssistant) 
 
     assert result2["type"] == "form"
     assert result2["errors"] == {"base": "auth"}
-    # RT unchanged.
     assert entry.data[CONF_REFRESH_TOKEN] == "stale-rt"
 
 

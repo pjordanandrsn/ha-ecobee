@@ -6,12 +6,13 @@
 
 A Home Assistant custom integration that polls ecobee thermostats
 **without** requiring an ecobee developer-portal API key. Authenticates
-against ecobee's Auth0 tenant using Resource Owner Password Grant
-(ROPG) — the same flow ecobee.com uses — and exposes per-room remote
-sensor data that the SmartThings cloud bridge hides.
+against ecobee's Auth0 tenant using the standard Authorization Code
+flow with PKCE + universal-login — the same flow ecobee.com uses on
+the web — and exposes per-room remote sensor data that the SmartThings
+cloud bridge hides.
 
 > **Status:** Maintained as part of the Anderson family wall-display
-> kiosk. Community PRs welcome — no SLA. Read-only in v0.2;
+> kiosk. Community PRs welcome — no SLA. Read-only in v0.3;
 > see [Read-only by design](#read-only-by-design).
 
 ## Why this fork exists
@@ -27,12 +28,16 @@ per-room remote sensor data**. Hallway/bedroom temperature and
 occupancy from the SmartSensors are not exposed.
 
 The ecobee mobile app and ecobee.com both authenticate against
-ecobee's Auth0 tenant using a public web `client_id` and Resource
-Owner Password Grant. The bash project [`r00k/ecobee-cli`][r00k] proved
-this works without a dev-portal API key.
+ecobee's Auth0 tenant using a public web `client_id`. The bash project
+[`r00k/ecobee-cli`][r00k] proved that bypassing the dev-portal API
+key is possible. v0.3 of this integration uses the Auth0
+Authorization Code flow with PKCE + universal-login (the same flow
+ecobee.com itself uses on the web), which means MFA is handled
+natively by Auth0's hosted prompt pages — no per-step HA UI needed.
 
-This integration ships ~150 LoC of ROPG auth + ~100 LoC of API client
-mapped onto HA entities, **including** per-room remote sensors.
+This integration ships ~450 LoC of Auth0 universal-login + ~100 LoC
+of API client mapped onto HA entities, **including** per-room remote
+sensors.
 
 ## Install via HACS
 
@@ -106,16 +111,24 @@ the ecobee app (e.g. `Living Room` → `living_room`).
 
 ## 2FA / MFA support
 
-**Shipped in v0.2.0.** If your ecobee account has two-factor auth
-enabled, the config flow walks you through the MFA challenge:
+**Native in v0.3.0+.** The integration uses Auth0's universal-login
+flow, which is the same web sign-in ecobee.com uses. If your account
+has 2FA enabled, the MFA prompt is handled by Auth0's hosted page
+during the redirect chain — there's no extra Home Assistant step.
+The single password form remains the only thing you fill out;
+Auth0's /u/mfa-* page handles the second-factor challenge inline.
 
-1. Enter email + password.
-2. Pick a configured factor (Authenticator app, SMS, push
-   notification — whatever you set up on ecobee.com).
-3. Enter the 6-digit code (or approve the push) to complete the flow.
+For OTP / authenticator-app and push factors that you complete
+externally, the integration's generic prompt handler walks the chain
+to completion automatically. For factors that require typing a code
+into Auth0's hosted form, you may need to sign in to
+[ecobee.com](https://www.ecobee.com) once from a browser first so
+Auth0 sets a device-trust cookie, then retry the integration setup.
 
-Supported Auth0 factor types: `otp` (authenticator app), `oob` SMS,
-`oob` push-notification.
+> v0.2.0 attempted MFA via Auth0 ROPG MFA grants, which ecobee's
+> web client rejects with `unauthorized_client`. v0.3.0 switches to
+> authorization-code + universal-login, which sidesteps that
+> limitation entirely.
 
 Refresh-token rotation works the same regardless of MFA: the token
 issued after MFA is a normal Auth0 refresh token and the integration
@@ -125,7 +138,7 @@ revoked (password change or ecobee revoking the web client RTs).
 
 ## Read-only by design
 
-v0.2 ships **read-only**: the climate entity exposes state but does
+v0.3 ships **read-only**: the climate entity exposes state but does
 NOT implement `set_hvac_mode` / `set_hold` / etc. Reasons:
 
 1. The fork's stated goal is per-room sensor visibility, not control.
@@ -181,10 +194,10 @@ adding a `POST /1/thermostat` helper plus the corresponding
 ## Upstreaming progress
 
 No upstream tracking — HA core's ecobee integration won't accept this
-approach (storing the user's password to mint tokens isn't the
-recommended HA pattern), and ecobee hasn't restored the public dev
-portal. If `pyecobee` ever ships ROPG natively and the core
-integration adopts it, this fork can shrink down to just the per-room
+approach (proxying the user's credentials through Auth0's
+universal-login isn't the recommended HA pattern), and ecobee hasn't
+restored the public dev portal. If the HA core integration ever
+adopts a similar fallback, this fork can shrink to just the per-room
 sensor mapping logic.
 
 If ecobee restores the dev portal, the cleanest migration is:
@@ -195,7 +208,7 @@ If ecobee restores the dev portal, the cleanest migration is:
 
 ## Tests
 
-77 tests live in `tests/`. Run locally:
+97 tests live in `tests/`. Run locally:
 
 ```sh
 python3 -m venv /tmp/ecobee-test-venv
