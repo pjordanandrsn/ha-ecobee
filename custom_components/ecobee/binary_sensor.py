@@ -1,4 +1,4 @@
-"""Binary sensor platform for the Ecobee Anderson fork integration.
+"""Binary sensor platform for the Ecobee community fork integration.
 
 We expose one occupancy binary_sensor per remote sensor — the other
 half of the SmartThings-bypass payoff (SmartThings hides per-room

@@ -5,7 +5,12 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from custom_components.ecobee.auth import InvalidCredentialsError
+from custom_components.ecobee.auth import (
+    InvalidCredentialsError,
+    MFACodeExpiredError,
+    MFACodeInvalidError,
+    MFACodeRequiredError,
+)
 from custom_components.ecobee.const import (
     CONF_PASSWORD,
     CONF_REFRESH_TOKEN,
@@ -15,6 +20,23 @@ from custom_components.ecobee.const import (
 from homeassistant import config_entries, setup
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+
+def _mfa_required_exc(
+    challenge_type: str = "otp",
+    email: str = "user@example.com",
+) -> MFACodeRequiredError:
+    """Build an MFACodeRequiredError shaped like one raised by login()."""
+    ex = MFACodeRequiredError(
+        prompt_url=(
+            f"https://auth.ecobee.com/u/mfa-{challenge_type}-challenge?state=MFA"
+        ),
+        state="MFA",
+        challenge_type=challenge_type,
+        verifier="VERIFIER-X",
+        email=email,
+    )
+    return ex
 
 
 def _mock_auth(refresh_token: str = "rt-abc", email: str = "user@example.com"):
@@ -325,3 +347,180 @@ async def test_reauth_with_legacy_entry_using_title_for_email(hass: HomeAssistan
 
     assert result2["type"] == "abort"
     assert result2["reason"] == "reauth_successful"
+
+
+# ---------------------------------------------------------------------------
+# v0.3.1: MFA-code step (Auth0 OTP / SMS / recovery-code challenge prompts)
+# ---------------------------------------------------------------------------
+
+
+async def test_user_step_mfa_required_transitions_to_mfa_code_step(
+    hass: HomeAssistant,
+) -> None:
+    """When login raises MFACodeRequiredError, flow advances to mfa_code step."""
+    await setup.async_setup_component(hass, "persistent_notification", {})
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+
+    with patch(
+        "custom_components.ecobee.config_flow.EcobeeAuth.login",
+        AsyncMock(side_effect=_mfa_required_exc()),
+    ):
+        result2 = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {CONF_USERNAME: "user@example.com", CONF_PASSWORD: "hunter2"},
+        )
+
+    assert result2["type"] == "form"
+    assert result2["step_id"] == "mfa_code"
+    # Description placeholders surface a friendly label so the form copy
+    # can say "Enter the 6-digit code from your authenticator app".
+    assert result2.get("description_placeholders", {}).get("challenge_label") == (
+        "authenticator app"
+    )
+
+
+async def test_mfa_code_step_happy_path_creates_entry(
+    hass: HomeAssistant,
+) -> None:
+    """Submitting a valid code creates the entry without persisting password."""
+    await setup.async_setup_component(hass, "persistent_notification", {})
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+
+    with patch(
+        "custom_components.ecobee.config_flow.EcobeeAuth.login",
+        AsyncMock(side_effect=_mfa_required_exc()),
+    ):
+        result2 = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {CONF_USERNAME: "user@example.com", CONF_PASSWORD: "hunter2"},
+        )
+    assert result2["step_id"] == "mfa_code"
+
+    fresh_auth = _mock_auth(refresh_token="rt-after-mfa")
+    with patch(
+        "custom_components.ecobee.config_flow.EcobeeAuth.continue_with_mfa_code",
+        AsyncMock(return_value=fresh_auth),
+    ), patch("custom_components.ecobee.async_setup_entry", return_value=True):
+        result3 = await hass.config_entries.flow.async_configure(
+            result2["flow_id"],
+            {"code": "123456"},
+        )
+        await hass.async_block_till_done()
+
+    assert result3["type"] == "create_entry"
+    assert result3["title"] == "user@example.com"
+    assert result3["data"][CONF_REFRESH_TOKEN] == "rt-after-mfa"
+    assert CONF_PASSWORD not in result3["data"]
+
+
+async def test_mfa_code_step_wrong_code_re_renders_form_without_restarting(
+    hass: HomeAssistant,
+) -> None:
+    """Wrong code shows mfa_invalid_code error; flow stays on mfa_code step."""
+    await setup.async_setup_component(hass, "persistent_notification", {})
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+
+    with patch(
+        "custom_components.ecobee.config_flow.EcobeeAuth.login",
+        AsyncMock(side_effect=_mfa_required_exc()),
+    ):
+        result2 = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {CONF_USERNAME: "user@example.com", CONF_PASSWORD: "hunter2"},
+        )
+
+    with patch(
+        "custom_components.ecobee.config_flow.EcobeeAuth.continue_with_mfa_code",
+        AsyncMock(side_effect=MFACodeInvalidError("wrong code")),
+    ):
+        result3 = await hass.config_entries.flow.async_configure(
+            result2["flow_id"],
+            {"code": "000000"},
+        )
+
+    assert result3["type"] == "form"
+    assert result3["step_id"] == "mfa_code"
+    assert result3["errors"] == {"base": "mfa_invalid_code"}
+
+
+async def test_mfa_code_step_expired_state_bounces_to_user_step(
+    hass: HomeAssistant,
+) -> None:
+    """Expired MFA prompt bounces back to email/password with mfa_expired error."""
+    await setup.async_setup_component(hass, "persistent_notification", {})
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+
+    with patch(
+        "custom_components.ecobee.config_flow.EcobeeAuth.login",
+        AsyncMock(side_effect=_mfa_required_exc()),
+    ):
+        result2 = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {CONF_USERNAME: "user@example.com", CONF_PASSWORD: "hunter2"},
+        )
+
+    with patch(
+        "custom_components.ecobee.config_flow.EcobeeAuth.continue_with_mfa_code",
+        AsyncMock(side_effect=MFACodeExpiredError("session expired")),
+    ):
+        result3 = await hass.config_entries.flow.async_configure(
+            result2["flow_id"],
+            {"code": "123456"},
+        )
+
+    assert result3["type"] == "form"
+    assert result3["step_id"] == "user"
+    assert result3["errors"] == {"base": "mfa_expired"}
+
+
+async def test_reauth_with_mfa_required_creates_mfa_step(
+    hass: HomeAssistant,
+) -> None:
+    """Reauth path also surfaces mfa_code step when 2FA fires mid-login."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="user@example.com",
+        title="user@example.com",
+        data={CONF_USERNAME: "user@example.com", CONF_REFRESH_TOKEN: "stale"},
+    )
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": "reauth", "entry_id": entry.entry_id},
+        data=entry.data,
+    )
+
+    with patch(
+        "custom_components.ecobee.config_flow.EcobeeAuth.login",
+        AsyncMock(side_effect=_mfa_required_exc()),
+    ):
+        result2 = await hass.config_entries.flow.async_configure(
+            result["flow_id"],
+            {CONF_PASSWORD: "pw"},
+        )
+
+    assert result2["step_id"] == "mfa_code"
+
+    fresh_auth = _mock_auth(refresh_token="fresh-rt")
+    with patch(
+        "custom_components.ecobee.config_flow.EcobeeAuth.continue_with_mfa_code",
+        AsyncMock(return_value=fresh_auth),
+    ), patch("custom_components.ecobee.async_setup_entry", return_value=True):
+        result3 = await hass.config_entries.flow.async_configure(
+            result2["flow_id"],
+            {"code": "123456"},
+        )
+        await hass.async_block_till_done()
+
+    assert result3["type"] == "abort"
+    assert result3["reason"] == "reauth_successful"
+    assert entry.data[CONF_REFRESH_TOKEN] == "fresh-rt"

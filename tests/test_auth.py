@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import json
 import urllib.parse
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from custom_components.ecobee.auth import (
     EcobeeAuth,
     InvalidCredentialsError,
     InvalidGrantError,
+    MFACodeExpiredError,
+    MFACodeInvalidError,
+    MFACodeRequiredError,
     _authorize,
     _exchange_code,
     _handle_custom_prompt,
@@ -413,31 +416,29 @@ async def test_resume_handles_custom_prompt_chain():
 
 
 @pytest.mark.asyncio
-async def test_resume_with_mfa_prompt_chain():
-    """Auth0 /u/mfa-otp-challenge goes through the same generic prompt handler."""
-    # Initial resume -> /u/mfa-otp-challenge
-    # GET prompt page returns 200 (we just inspect the props)
-    # POST prompt -> /authorize/resume
-    # second resume -> callback w/ code
+async def test_resume_with_mfa_prompt_chain_raises_mfa_code_required():
+    """Auth0 /u/mfa-otp-challenge raises MFACodeRequiredError so config_flow can prompt."""
+    # v0.3.1: code-entry MFA prompts (/u/mfa-otp-challenge,
+    # /u/mfa-sms-challenge, /u/mfa-recovery-code-challenge) are
+    # detected in _handle_custom_prompt BEFORE the POST and surfaced
+    # as MFACodeRequiredError. The config_flow catches it, prompts
+    # the user for the code, and resumes via continue_with_mfa_code.
     mfa_loc = (
         "https://auth.ecobee.com/u/mfa-otp-challenge?state=MFA-STATE"
-    )
-    next_resume_loc = "https://auth.ecobee.com/authorize/resume?state=RESUME-3"
-    callback_loc = (
-        "https://www.ecobee.com/home/authCallback?code=AUTHCODE-MFA&state=ST"
     )
     session = _routed_session(
         get_responses=[
             _redir(mfa_loc),
             _html(200, "<html><body>mfa prompt</body></html>"),
-            _redir(callback_loc),
         ],
-        post_responses=[
-            _redir(next_resume_loc),
-        ],
+        # No POSTs queued: handler must raise BEFORE attempting POST.
+        post_responses=[],
     )
-    code = await _resume_to_code(session, "RESUME-1")
-    assert code == "AUTHCODE-MFA"
+    with pytest.raises(MFACodeRequiredError) as exc_info:
+        await _resume_to_code(session, "RESUME-1")
+    assert exc_info.value.challenge_type == "otp"
+    assert "mfa-otp-challenge" in exc_info.value.prompt_url
+    assert exc_info.value.state == "MFA-STATE"
 
 
 @pytest.mark.asyncio
@@ -571,12 +572,10 @@ async def test_exchange_code_invalid_grant_raises():
 async def test_full_login_e2e_no_mfa():
     """End-to-end login on a non-MFA account: 5 steps, returns ready EcobeeAuth.
 
-    auth.login() builds its own private cookie-jar session; we patch
-    aiohttp.ClientSession to return a routed-session mock so we can
-    assert the full chain end-to-end.
+    v0.3.1: auth.login() reuses the passed-in session so the cookie
+    jar carries through to a possible continue_with_mfa_code follow-
+    up. We pass the routed-session mock directly.
     """
-    # Internal session: routed mock that returns the right responses
-    # for each step in order.
     chain = _routed_session(
         get_responses=[
             # /authorize -> /u/login/identifier
@@ -603,20 +602,7 @@ async def test_full_login_e2e_no_mfa():
         ],
     )
 
-    # The outer session passed to login() is just stored as
-    # self._session (used for refresh). It doesn't make any HTTP
-    # calls during login(); login() builds its own cookie-jar session.
-    outer_session = MagicMock()
-
-    chain_cm = MagicMock()
-    chain_cm.__aenter__ = AsyncMock(return_value=chain)
-    chain_cm.__aexit__ = AsyncMock(return_value=None)
-
-    with patch(
-        "custom_components.ecobee.auth.aiohttp.ClientSession",
-        return_value=chain_cm,
-    ):
-        auth = await EcobeeAuth.login(outer_session, "user@example.com", "secret")
+    auth = await EcobeeAuth.login(chain, "user@example.com", "secret")
 
     assert auth.refresh_token == "RT-final"
     assert auth._access_token == "AT-final"
@@ -660,24 +646,21 @@ async def test_full_login_e2e_with_custom_prompt():
         ],
     )
 
-    outer_session = MagicMock()
-    chain_cm = MagicMock()
-    chain_cm.__aenter__ = AsyncMock(return_value=chain)
-    chain_cm.__aexit__ = AsyncMock(return_value=None)
-
-    with patch(
-        "custom_components.ecobee.auth.aiohttp.ClientSession",
-        return_value=chain_cm,
-    ):
-        auth = await EcobeeAuth.login(outer_session, "user@example.com", "secret")
+    auth = await EcobeeAuth.login(chain, "user@example.com", "secret")
 
     assert auth.refresh_token == "RT-prompt"
     assert auth._access_token == "AT-prompt"
 
 
 @pytest.mark.asyncio
-async def test_full_login_e2e_with_mfa_prompt_chain():
-    """E2E login on a 2FA account: Auth0 chains /u/mfa-* between password and callback."""
+async def test_full_login_e2e_with_mfa_prompt_chain_raises_mfa_required():
+    """E2E login on a 2FA account: Auth0 redirects to /u/mfa-otp-challenge.
+
+    v0.3.1: login() pumps through identifier + password and then runs
+    into the MFA prompt during _resume_to_code, which raises
+    MFACodeRequiredError. login() catches it, enriches with verifier
+    + email, and re-raises so the config_flow can prompt the user.
+    """
     chain = _routed_session(
         get_responses=[
             # /authorize -> /u/login/identifier
@@ -686,19 +669,39 @@ async def test_full_login_e2e_with_mfa_prompt_chain():
             _redir("https://auth.ecobee.com/u/mfa-otp-challenge?state=MFA"),
             # GET MFA prompt page
             _html(200, "<html>mfa</html>"),
-            # second /authorize/resume -> callback
-            _redir(
-                "https://www.ecobee.com/home/authCallback?code=MFA-C&state=ST"
-            ),
         ],
         post_responses=[
             # /u/login/identifier -> /u/login/password
             _redir("https://auth.ecobee.com/u/login/password?state=B"),
             # /u/login/password -> /authorize/resume
             _redir("https://auth.ecobee.com/authorize/resume?state=C"),
-            # POST MFA prompt -> /authorize/resume
-            _redir("https://auth.ecobee.com/authorize/resume?state=D"),
-            # /oauth/token
+        ],
+    )
+
+    with pytest.raises(MFACodeRequiredError) as exc_info:
+        await EcobeeAuth.login(chain, "user@example.com", "secret")
+
+    assert exc_info.value.challenge_type == "otp"
+    assert exc_info.value.email == "user@example.com"
+    # verifier is enriched by login() so continue_with_mfa_code can
+    # exchange the eventual auth code for tokens.
+    assert exc_info.value.verifier  # non-empty string
+
+
+@pytest.mark.asyncio
+async def test_continue_with_mfa_code_completes_login():
+    """After MFACodeRequiredError, config_flow calls continue_with_mfa_code."""
+    chain = _routed_session(
+        get_responses=[
+            # /authorize/resume -> callback
+            _redir(
+                "https://www.ecobee.com/home/authCallback?code=MFA-C&state=ST"
+            ),
+        ],
+        post_responses=[
+            # POST mfa-otp-challenge code -> /authorize/resume
+            _redir("https://auth.ecobee.com/authorize/resume?state=POSTMFA"),
+            # /oauth/token (code exchange)
             _token_resp(
                 200,
                 {
@@ -709,18 +712,66 @@ async def test_full_login_e2e_with_mfa_prompt_chain():
             ),
         ],
     )
-    outer_session = MagicMock()
-    chain_cm = MagicMock()
-    chain_cm.__aenter__ = AsyncMock(return_value=chain)
-    chain_cm.__aexit__ = AsyncMock(return_value=None)
 
-    with patch(
-        "custom_components.ecobee.auth.aiohttp.ClientSession",
-        return_value=chain_cm,
-    ):
-        auth = await EcobeeAuth.login(outer_session, "user@example.com", "secret")
+    auth = await EcobeeAuth.continue_with_mfa_code(
+        chain,
+        prompt_url="https://auth.ecobee.com/u/mfa-otp-challenge?state=MFA",
+        state="MFA",
+        code="123456",
+        verifier="VERIFIER-X",
+        email="user@example.com",
+    )
 
     assert auth.refresh_token == "RT-mfa"
+    assert auth.email == "user@example.com"
+
+
+@pytest.mark.asyncio
+async def test_continue_with_mfa_code_wrong_code_raises_invalid():
+    """Auth0 rejects wrong code by re-rendering the prompt with status 200."""
+    bad = MagicMock()
+    bad.status = 200
+    bad.headers = {}
+    bad.text = AsyncMock(
+        return_value="<html><body>Wrong code, try again.</body></html>"
+    )
+    chain = _routed_session(
+        post_responses=[bad],
+    )
+
+    with pytest.raises(MFACodeInvalidError):
+        await EcobeeAuth.continue_with_mfa_code(
+            chain,
+            prompt_url="https://auth.ecobee.com/u/mfa-otp-challenge?state=MFA",
+            state="MFA",
+            code="000000",
+            verifier="V",
+            email="user@example.com",
+        )
+
+
+@pytest.mark.asyncio
+async def test_continue_with_mfa_code_expired_state_raises_expired():
+    """When the prompt's state has aged out, Auth0's re-render mentions 'expired'."""
+    expired = MagicMock()
+    expired.status = 200
+    expired.headers = {}
+    expired.text = AsyncMock(
+        return_value="<html><body>Session has expired. Please sign in again.</body></html>"
+    )
+    chain = _routed_session(
+        post_responses=[expired],
+    )
+
+    with pytest.raises(MFACodeExpiredError):
+        await EcobeeAuth.continue_with_mfa_code(
+            chain,
+            prompt_url="https://auth.ecobee.com/u/mfa-otp-challenge?state=OLD",
+            state="OLD",
+            code="123456",
+            verifier="V",
+            email="user@example.com",
+        )
 
 
 @pytest.mark.asyncio
@@ -739,17 +790,9 @@ async def test_login_no_refresh_token_in_response_raises_runtime():
             _token_resp(200, {"access_token": "AT-only", "expires_in": 3600}),
         ],
     )
-    outer_session = MagicMock()
-    chain_cm = MagicMock()
-    chain_cm.__aenter__ = AsyncMock(return_value=chain)
-    chain_cm.__aexit__ = AsyncMock(return_value=None)
 
-    with patch(
-        "custom_components.ecobee.auth.aiohttp.ClientSession",
-        return_value=chain_cm,
-    ):
-        with pytest.raises(RuntimeError):
-            await EcobeeAuth.login(outer_session, "u@e.com", "x")
+    with pytest.raises(RuntimeError, match="no refresh_token"):
+        await EcobeeAuth.login(chain, "u@e.com", "x")
 
 
 @pytest.mark.asyncio
@@ -772,14 +815,6 @@ async def test_login_invalid_credentials_raises_at_password_step():
             bad_pw,
         ],
     )
-    outer_session = MagicMock()
-    chain_cm = MagicMock()
-    chain_cm.__aenter__ = AsyncMock(return_value=chain)
-    chain_cm.__aexit__ = AsyncMock(return_value=None)
 
-    with patch(
-        "custom_components.ecobee.auth.aiohttp.ClientSession",
-        return_value=chain_cm,
-    ):
-        with pytest.raises(InvalidCredentialsError):
-            await EcobeeAuth.login(outer_session, "u@e.com", "wrong")
+    with pytest.raises(InvalidCredentialsError):
+        await EcobeeAuth.login(chain, "u@e.com", "wrong")

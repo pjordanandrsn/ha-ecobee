@@ -1,4 +1,4 @@
-"""Climate platform for the Ecobee Anderson fork integration.
+"""Climate platform for the Ecobee community fork integration.
 
 Read-only v0.1: we expose current/target temperatures, current humidity,
 HVAC mode, and HVAC action so the dashboard can show the same data the

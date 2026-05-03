@@ -1,4 +1,4 @@
-"""DataUpdateCoordinator for the Ecobee Anderson fork integration.
+"""DataUpdateCoordinator for the Ecobee community fork integration.
 
 We poll once per ``CONF_SCAN_INTERVAL`` (default 5 min) and stash the
 raw thermostatList. Entity classes pull from ``coordinator.data`` and

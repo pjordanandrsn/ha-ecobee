@@ -1,4 +1,4 @@
-"""Weather platform for the Ecobee Anderson fork integration.
+"""Weather platform for the Ecobee community fork integration.
 
 ecobee includes a weather forecast block per thermostat (location-based,
 sourced from a third-party feed). We surface it as a weather entity

@@ -1,4 +1,4 @@
-"""Sensor platform for the Ecobee Anderson fork integration.
+"""Sensor platform for the Ecobee community fork integration.
 
 We expose two flavors of sensor:
 

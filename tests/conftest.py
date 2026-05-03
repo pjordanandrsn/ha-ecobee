@@ -1,4 +1,4 @@
-"""Test fixtures for the Ecobee Anderson fork integration.
+"""Test fixtures for the Ecobee community fork integration.
 
 In the standalone repo layout, ``custom_components/`` sits at the repo
 root. Prepend the repo root to sys.path so ``import

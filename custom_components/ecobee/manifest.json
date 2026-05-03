@@ -1,6 +1,6 @@
 {
   "domain": "ecobee",
-  "name": "Ecobee (Anderson fork)",
+  "name": "Ecobee (community fork)",
   "codeowners": ["@pjordanandrsn"],
   "config_flow": true,
   "dependencies": [],
@@ -9,5 +9,5 @@
   "issue_tracker": "https://github.com/pjordanandrsn/ha-ecobee/issues",
   "loggers": ["custom_components.ecobee"],
   "requirements": [],
-  "version": "0.3.0-anderson-fork"
+  "version": "0.3.1"
 }

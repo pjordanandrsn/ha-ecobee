@@ -2,7 +2,7 @@
   "config": {
     "step": {
       "user": {
-        "title": "Ecobee (Anderson fork)",
+        "title": "Ecobee (community fork)",
         "description": "Sign in with your ecobee.com account.\n\nThis fork bypasses ecobee's shut-down developer portal by signing you in through ecobee's web login, the same way ecobee.com does. If your account has two-factor authentication enabled, complete the 2FA prompt that appears in the ecobee login page during the sign-in chain - Auth0 handles MFA inline, no extra HA step needed.",
         "data": {
           "username": "Email",
@@ -15,10 +15,19 @@
         "data": {
           "password": "Password"
         }
+      },
+      "mfa_code": {
+        "title": "Two-factor verification",
+        "description": "Enter the verification code from your {challenge_label} for {username}.",
+        "data": {
+          "code": "Verification code"
+        }
       }
     },
     "error": {
       "auth": "Invalid email or password.",
+      "mfa_invalid_code": "That code didn't match. Try again.",
+      "mfa_expired": "Your verification session expired. Re-enter your email and password to start over.",
       "auth0_unreachable": "Could not reach auth.ecobee.com. Check the HA host's outbound network/DNS.",
       "auth0_step_authorize": "Auth0 /authorize step failed - the universal-login entry point did not accept our request. Check Settings -> System -> Logs for the 'Ecobee auth: step=authorize' line.",
       "auth0_step_login_form": "Auth0 login form (identifier or password) returned an unexpected response. Check the HA log for 'POST .../login/' lines.",

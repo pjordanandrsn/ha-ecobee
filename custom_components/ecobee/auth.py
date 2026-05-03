@@ -16,17 +16,15 @@ v0.3 replaces v0.2's Resource Owner Password Grant. Why the change:
   ``_handle_custom_prompt`` helper handles all the in-between
   ``/u/mfa-*`` and ``/u/custom-prompt/<id>`` pages generically.
 
-Differences vs the parallel Generac fork (which uses the same flow
-against the same Auth0 tenant):
+Notes on this implementation:
 
 * No DPoP. ecobee's web client doesn't enforce DPoP — Bearer tokens
-  are accepted on every API call. This strips the entire ES256
-  keypair / JWK thumbprint / DPoP-Nonce dance.
+  are accepted on every API call.
 * The redirect URI is the web callback (``https://www.ecobee.com/home
   /authCallback``) rather than a deep-link URI scheme. We never
   navigate to it; we parse ``?code=...&state=...`` from the
   ``Location`` header on the eventual 302.
-* Persisted credential is ``{email, refresh_token}``; no ``dpop_pem``.
+* Persisted credential is ``{email, refresh_token}``.
 """
 
 from __future__ import annotations
@@ -96,6 +94,64 @@ class InvalidGrantError(Exception):
 
 class InvalidCredentialsError(Exception):
     """Raised when the user-supplied email/password is rejected at login."""
+
+
+class MFACodeRequiredError(Exception):
+    """Raised by ``EcobeeAuth.login`` when Auth0 surfaces a code-entry MFA prompt.
+
+    Carries everything the config_flow needs to bounce out, prompt the
+    user for the code, and resume via ``EcobeeAuth.continue_with_mfa_code``.
+    The aiohttp session's cookie jar already holds the Auth0 session
+    cookies — those persist across calls because we use HA's shared
+    client session.
+
+    Attributes:
+        prompt_url: Absolute URL of the Auth0 prompt page (we POST the
+            code back to this same URL).
+        state: ``state`` query param Auth0 issued for this prompt; must
+            be echoed back in the form body.
+        challenge_type: Which factor type Auth0 chose ("otp" / "sms" /
+            "recovery"). Used by the config_flow to pick the right form
+            label.
+        verifier: The PKCE ``code_verifier`` from the original
+            ``/authorize`` call. Required by the final
+            ``/oauth/token`` exchange after the resume completes.
+        email: Email the user logged in with — needed to set the
+            entry's ``unique_id`` after resume.
+    """
+
+    def __init__(
+        self,
+        *,
+        prompt_url: str,
+        state: str,
+        challenge_type: str,
+        verifier: str = "",
+        email: str = "",
+    ) -> None:
+        super().__init__(
+            f"MFA code required: type={challenge_type} url={prompt_url[:80]}"
+        )
+        self.prompt_url = prompt_url
+        self.state = state
+        self.challenge_type = challenge_type
+        self.verifier = verifier
+        self.email = email
+
+
+class MFACodeInvalidError(Exception):
+    """Raised when the user's submitted MFA code was wrong.
+
+    Config_flow re-renders the same code form with an error so the
+    user can retype without restarting from email/password.
+    """
+
+
+class MFACodeExpiredError(Exception):
+    """Raised when the MFA prompt's state has expired (typically ~10 min).
+
+    Config_flow bounces back to the email/password step.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -237,10 +293,10 @@ async def _resume_to_code(session: aiohttp.ClientSession, resume_state: str) -> 
     Loop bound prevents infinite redirect storms if a prompt can't be
     auto-handled.
 
-    The bound is higher than Generac's (5 vs 3) because MFA flows can
-    chain identifier -> password -> mfa-detect -> mfa-otp-challenge ->
-    custom-prompt before reaching the callback, so 3 was occasionally
-    too tight on 2FA-enabled accounts.
+    The bound is set to 5 because MFA flows can chain identifier ->
+    password -> mfa-detect -> mfa-otp-challenge -> custom-prompt before
+    reaching the callback; tighter bounds were occasionally too tight
+    on 2FA-enabled accounts.
     """
     headers = {"User-Agent": USER_AGENT_WEB, "Accept": "text/html,*/*"}
     for attempt in range(5):
@@ -299,15 +355,16 @@ async def _handle_custom_prompt(session: aiohttp.ClientSession, loc: str) -> str
     for the primary button (Auth0's universal convention — confirmed
     via the auth0 universal-login source).
 
-    The same handler covers every Auth0 prompt page we might encounter
-    during login: ``/u/custom-prompt/<id>`` (T&C, profile completion),
-    ``/u/mfa-detect``, ``/u/mfa-otp-challenge``, ``/u/mfa-push-*``,
-    etc. For pages that need genuine user input (entering an OTP code
-    in an external prompt), the POST will return 200 with the page
-    again instead of a 302 — we surface that as an actionable error.
-    Note: in this integration's MFA flow, the 6-digit OTP code IS the
-    user input; the user enters it on Auth0's hosted page during the
-    redirect chain, not in our config-flow form.
+    The same handler covers most Auth0 prompts: ``/u/custom-prompt/<id>``
+    (T&C, profile completion), ``/u/mfa-detect``, ``/u/mfa-push-*`` (push
+    auto-approves once the user taps the notification on their phone).
+
+    For prompts that REQUIRE typing a value into the form (the 6-digit
+    code on ``/u/mfa-otp-challenge`` etc.), ``action=default`` returns
+    400 because the form has no `code` field. We short-circuit those
+    prompts BEFORE the POST and raise ``MFACodeRequiredError`` with the
+    state needed to resume after the user provides the code via our
+    config flow's mfa-code step.
     """
     abs_url = (
         loc if loc.startswith("http") else f"https://{AUTH0_DOMAIN}{loc}"
@@ -317,6 +374,24 @@ async def _handle_custom_prompt(session: aiohttp.ClientSession, loc: str) -> str
     state = qs.get("state", [""])[0]
     if not state:
         raise RuntimeError(f"step=custom-prompt: no state in url={abs_url!r}")
+
+    # Recognise code-entry MFA prompts up-front. Path-pattern match
+    # because Auth0 names these consistently across tenants. If new
+    # variants surface (mfa-recovery-code-challenge etc.), the regex
+    # below catches them — keep it broad on purpose.
+    if re.search(r"/u/mfa-(otp|sms|recovery-code)(-challenge)?(/|\?|$)", parsed.path):
+        challenge_type = "otp" if "otp" in parsed.path else (
+            "sms" if "sms" in parsed.path else "recovery"
+        )
+        _LOGGER.warning(
+            "Ecobee auth: step=custom-prompt code-required prompt=%s url=%s",
+            challenge_type, abs_url[:160],
+        )
+        raise MFACodeRequiredError(
+            prompt_url=abs_url,
+            state=state,
+            challenge_type=challenge_type,
+        )
 
     # Fetch the page to inspect the embedded prompt config. Auth0
     # universal-login pages ship the React props as JSON inside a
@@ -514,15 +589,27 @@ class EcobeeAuth:
         verifier, challenge = _make_pkce()
         state = _b64url(secrets.token_bytes(32))
 
-        jar = aiohttp.CookieJar(unsafe=True)
-        async with aiohttp.ClientSession(cookie_jar=jar) as login_session:
-            login_state = await _authorize(login_session, state, challenge)
-            pw_state = await _identifier_step(login_session, login_state, email)
-            resume_state = await _password_step(
-                login_session, pw_state, email, password
-            )
-            code = await _resume_to_code(login_session, resume_state)
-            tokens = await _exchange_code(login_session, code, verifier)
+        # Use the shared session so cookies persist across the call.
+        # If Auth0 surfaces a code-entry MFA prompt mid-flow,
+        # _handle_custom_prompt raises MFACodeRequiredError which
+        # bubbles out of _resume_to_code; the config_flow catches it,
+        # prompts the user for the code, then calls
+        # continue_with_mfa_code on the same shared session so the
+        # cookie jar still holds Auth0's session cookies.
+        login_state = await _authorize(session, state, challenge)
+        pw_state = await _identifier_step(session, login_state, email)
+        resume_state = await _password_step(
+            session, pw_state, email, password
+        )
+        try:
+            code = await _resume_to_code(session, resume_state)
+        except MFACodeRequiredError as ex:
+            # Enrich with the verifier + email so continue_with_mfa_code
+            # has everything it needs once the user provides the code.
+            ex.verifier = verifier
+            ex.email = email
+            raise
+        tokens = await _exchange_code(session, code, verifier)
 
         refresh_token = tokens.get("refresh_token")
         if not refresh_token:
@@ -539,6 +626,123 @@ class EcobeeAuth:
             tokens.get("expires_in"),
             tokens.get("scope"),
             tokens.get("token_type"),
+        )
+        return auth
+
+    @classmethod
+    async def continue_with_mfa_code(
+        cls,
+        session: aiohttp.ClientSession,
+        *,
+        prompt_url: str,
+        state: str,
+        code: str,
+        verifier: str,
+        email: str,
+    ) -> "EcobeeAuth":
+        """Resume login after the user provides an MFA code.
+
+        Caller is the config_flow's mfa-code step. ``prompt_url`` and
+        ``state`` come from the MFACodeRequiredError raised by
+        ``login``; ``verifier`` and ``email`` were enriched there too.
+        ``session`` MUST be the same shared session used by ``login``
+        — its cookie jar holds the Auth0 session cookies.
+
+        Raises:
+            MFACodeInvalidError: Auth0 rejected the code (typo or
+                expired one-time-password); caller re-renders the
+                code form.
+            MFACodeExpiredError: the prompt's state has expired
+                (~10 min); caller bounces back to the password step.
+            RuntimeError: unexpected redirect / network failure.
+        """
+        body = {"state": state, "code": code}
+        headers = {
+            "User-Agent": USER_AGENT_WEB,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "text/html,*/*",
+            "Origin": f"https://{AUTH0_DOMAIN}",
+            "Referer": prompt_url,
+        }
+        async with session.post(
+            prompt_url, data=body, headers=headers, allow_redirects=False,
+        ) as resp:
+            status = resp.status
+            if status == 200:
+                # Auth0 re-renders the prompt form when the code is wrong
+                # or the prompt has expired. Inspect the page to choose
+                # which typed error to raise.
+                page = (await resp.text()).lower()
+                if "expired" in page or "session has expired" in page:
+                    raise MFACodeExpiredError(
+                        "MFA prompt expired; restart from email/password."
+                    )
+                raise MFACodeInvalidError(
+                    "MFA code rejected by Auth0; check the code and retry."
+                )
+            if status not in (302, 303):
+                page = (await resp.text())[:200]
+                raise RuntimeError(
+                    f"continue_with_mfa_code: POST -> {status}; body={page!r}"
+                )
+            new_loc = resp.headers["Location"]
+        _LOGGER.warning(
+            "Ecobee auth: step=mfa-code POST -> %d loc=%s",
+            status, new_loc[:200],
+        )
+
+        # Auth0 typically redirects back to /authorize/resume after a
+        # successful prompt POST; from there _resume_to_code chases the
+        # rest of the chain (which may include more prompts).
+        parsed = urllib.parse.urlparse(new_loc)
+        if parsed.path.endswith("/authorize/resume"):
+            new_state = urllib.parse.parse_qs(parsed.query).get("state", [""])[0]
+            if not new_state:
+                raise RuntimeError(
+                    f"continue_with_mfa_code: no state in {new_loc!r}"
+                )
+            try:
+                auth_code = await _resume_to_code(session, new_state)
+            except MFACodeRequiredError as ex:
+                # Chained MFA prompt (rare). Preserve carry-through state
+                # so the config_flow can prompt again.
+                ex.verifier = verifier
+                ex.email = email
+                raise
+        elif "/u/" in parsed.path:
+            # Auth0 chained another in-line prompt without going through
+            # /authorize/resume first. Hand off to _handle_custom_prompt
+            # via the standard loop.
+            try:
+                auth_code = await _resume_to_code(session, state)
+            except MFACodeRequiredError as ex:
+                ex.verifier = verifier
+                ex.email = email
+                raise
+        elif new_loc.startswith("https://www.ecobee.com/home/authCallback"):
+            # Direct callback (no further resume needed).
+            auth_code = urllib.parse.parse_qs(parsed.query).get("code", [""])[0]
+            if not auth_code:
+                raise RuntimeError(
+                    f"continue_with_mfa_code: callback had no code: {new_loc!r}"
+                )
+        else:
+            raise RuntimeError(
+                f"continue_with_mfa_code: unexpected redirect loc={new_loc!r}"
+            )
+
+        tokens = await _exchange_code(session, auth_code, verifier)
+        refresh_token = tokens.get("refresh_token")
+        if not refresh_token:
+            raise RuntimeError(
+                "continue_with_mfa_code: no refresh_token returned"
+            )
+        auth = cls(session, refresh_token, email=email)
+        auth._access_token = tokens["access_token"]
+        auth._access_token_exp = time.time() + int(tokens.get("expires_in", 0))
+        _LOGGER.info(
+            "ecobee universal-login + MFA OK: expires_in=%s scope=%s",
+            tokens.get("expires_in"), tokens.get("scope"),
         )
         return auth
 

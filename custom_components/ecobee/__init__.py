@@ -1,11 +1,11 @@
-"""Ecobee Anderson fork — top-level setup.
+"""Ecobee community fork — top-level setup.
 
 This integration shadows the HA core ``ecobee`` integration so we can
 use Resource Owner Password Grant against ecobee's Auth0 tenant, which
 the core integration doesn't support (it still expects a dev-portal
 API key — registration of which ecobee shut down in 2024).
 
-The setup pattern mirrors the parallel Generac fork:
+Setup pattern:
   1. Pull email + refresh_token out of entry.data.
   2. Build an EcobeeAuth from storage and wire the persist callback so
      Auth0 RT rotation gets written back into the ConfigEntry.

@@ -1,4 +1,4 @@
-"""Tests for the Ecobee Anderson fork integration setup/unload/reload."""
+"""Tests for the Ecobee community fork integration setup/unload/reload."""
 
 from __future__ import annotations
 

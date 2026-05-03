@@ -1,4 +1,4 @@
-# Ecobee (Anderson fork) — Home Assistant integration
+# Ecobee (community fork) — Home Assistant integration
 
 [![HACS Custom][hacs-badge]][hacs]
 [![Validate][validate-badge]][validate-workflow]
@@ -11,9 +11,8 @@ flow with PKCE + universal-login — the same flow ecobee.com uses on
 the web — and exposes per-room remote sensor data that the SmartThings
 cloud bridge hides.
 
-> **Status:** Maintained as part of the Anderson family wall-display
-> kiosk. Community PRs welcome — no SLA. Read-only in v0.3;
-> see [Read-only by design](#read-only-by-design).
+> **Status:** Maintained as a side-fork; community PRs welcome — no SLA.
+> Read-only in v0.3; see [Read-only by design](#read-only-by-design).
 
 ## Why this fork exists
 
@@ -47,11 +46,11 @@ sensors.
    - Repository: `https://github.com/pjordanandrsn/ha-ecobee`
    - Category: `Integration`
 4. Click **Add**.
-5. Find **Ecobee (Anderson fork)** in the HACS integration list and
+5. Find **Ecobee (community fork)** in the HACS integration list and
    click **Download**.
 6. Restart Home Assistant.
 7. **Settings → Devices & Services → Add Integration → Ecobee
-   (Anderson fork)** and follow [First-time setup](#first-time-setup).
+   (community fork)** and follow [First-time setup](#first-time-setup).
 
 ## Manual install (no HACS)
 
@@ -62,7 +61,7 @@ sensors.
    have any active config entries for the core integration first.
 2. Restart Home Assistant.
 3. Add via **Settings → Devices & Services → Add Integration → Ecobee
-   (Anderson fork)**.
+   (community fork)**.
 
 ## First-time setup
 
@@ -74,7 +73,7 @@ Adding the integration requires a Home Assistant **admin** session
 3. Search **Ecobee**. You may see two options:
    - **Ecobee** — the HA core one. Will fail unless you already have a
      dev-portal API key.
-   - **Ecobee (Anderson fork)** — pick **this** one.
+   - **Ecobee (community fork)** — pick **this** one.
 4. Enter your **ecobee.com** email and password (NOT your SmartThings
    login).
 5. Submit. If your account has 2FA enabled, see
@@ -111,30 +110,58 @@ the ecobee app (e.g. `Living Room` → `living_room`).
 
 ## 2FA / MFA support
 
-**Native in v0.3.0+.** The integration uses Auth0's universal-login
-flow, which is the same web sign-in ecobee.com uses. If your account
-has 2FA enabled, the MFA prompt is handled by Auth0's hosted page
-during the redirect chain — there's no extra Home Assistant step.
-The single password form remains the only thing you fill out;
-Auth0's /u/mfa-* page handles the second-factor challenge inline.
+**Native in v0.3.1+.** The integration uses Auth0's universal-login
+flow — the same web sign-in ecobee.com uses. The Home Assistant
+config flow starts as a single email + password form; if your
+account has 2FA enabled, Auth0 surfaces an OTP-challenge page
+mid-flow that the integration intercepts and turns into a Home
+Assistant **"Two-factor verification"** step.
 
-For OTP / authenticator-app and push factors that you complete
-externally, the integration's generic prompt handler walks the chain
-to completion automatically. For factors that require typing a code
-into Auth0's hosted form, you may need to sign in to
-[ecobee.com](https://www.ecobee.com) once from a browser first so
-Auth0 sets a device-trust cookie, then retry the integration setup.
+### What you'll see at setup
 
-> v0.2.0 attempted MFA via Auth0 ROPG MFA grants, which ecobee's
-> web client rejects with `unauthorized_client`. v0.3.0 switches to
-> authorization-code + universal-login, which sidesteps that
-> limitation entirely.
+1. **Email + password step** — submit your ecobee.com credentials.
+2. **(Only if 2FA is on) Two-factor verification step** — a single
+   field asking for the 6-digit code. Read it from your authenticator
+   app:
+   - **Authy / Google Authenticator / 1Password / Microsoft
+     Authenticator / Duo / etc.** — open the app, find your ecobee
+     entry, type the current code.
+   - **SMS / recovery code** — use the code Auth0 sends or your
+     stored recovery code.
+   - **Push notifications are NOT supported** in this version. If
+     your only factor is an Auth0 Guardian push prompt, set up a
+     backup OTP factor on ecobee.com first.
+3. **Done** — entry is created and thermostats + remote sensors
+   appear within ~30 seconds.
 
-Refresh-token rotation works the same regardless of MFA: the token
-issued after MFA is a normal Auth0 refresh token and the integration
-stores it in the entry data. **You should not need to re-enter the
-MFA code on subsequent restarts** — only when the refresh token gets
-revoked (password change or ecobee revoking the web client RTs).
+### Error handling
+
+- **Wrong code.** The form re-renders with a "code didn't match"
+  message; just type the new code without restarting from the
+  password step.
+- **Expired session (~10 minutes between password and code).** Auth0
+  ages out the prompt's state token; the flow bounces back to the
+  email + password step so a fresh session can be minted.
+- **No 2FA on the account.** The MFA step is skipped automatically;
+  setup completes after the password step.
+
+### Once-per-setup pattern
+
+The MFA prompt fires exactly **once** at config-entry creation (and
+once at reauth). After we have the post-MFA refresh token, all
+subsequent Auth0 token refreshes go through the regular
+`grant_type=refresh_token` path — no MFA prompt. **You should not
+need to re-enter the MFA code on subsequent restarts** — only when
+the refresh token gets revoked (password change or ecobee revoking
+the web client RTs).
+
+> **History.** v0.2.0 attempted MFA via Auth0 ROPG MFA grants, which
+> ecobee's web client rejects with `unauthorized_client`. v0.3.0
+> switched to authorization-code + universal-login but tried to walk
+> through the OTP prompt page programmatically (which doesn't work —
+> Auth0 expects a real code). v0.3.1 adds the dedicated
+> "Two-factor verification" step so the user types the code directly
+> into Home Assistant.
 
 ## Read-only by design
 
@@ -251,7 +278,7 @@ CI runs these on every push and PR — see
 the patterns of the HA core ecobee integration (also Apache 2.0). No
 upstream fork base.
 
-Copyright (c) 2026 Anderson family / pjordanandrsn.
+Copyright (c) 2026 pjordanandrsn.
 
 ## Acknowledgments
 

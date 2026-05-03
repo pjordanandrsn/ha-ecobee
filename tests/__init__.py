@@ -1,1 +1,1 @@
-"""Tests for the Ecobee Anderson fork integration."""
+"""Tests for the Ecobee community fork integration."""

@@ -1,4 +1,4 @@
-"""Constants for the Ecobee Anderson fork integration.
+"""Constants for the Ecobee community fork integration.
 
 This integration shadows the Home Assistant core ``ecobee`` integration
 because HA loads ``custom_components/`` first. The bypass exists for one
@@ -13,10 +13,10 @@ prompt pages (we just follow the redirect chain).
 from homeassistant.const import Platform
 
 DOMAIN = "ecobee"
-NAME = "Ecobee (Anderson fork)"
+NAME = "Ecobee (community fork)"
 MANUFACTURER = "ecobee"
 
-# Auth0 tenant + endpoints. Same tenant as the parallel Generac fork.
+# Auth0 tenant + endpoints.
 AUTH0_DOMAIN = "auth.ecobee.com"
 
 # /authorize is the universal-login entry point. We GET it with the
