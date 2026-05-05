@@ -1,0 +1,86 @@
+create_vacation:
+  name: Create vacation
+  description: >-
+    Schedule a vacation event on an ecobee thermostat. The thermostat will
+    hold the supplied heat / cool setpoints + fan mode between start and
+    end, then automatically resume the schedule. Equivalent to creating
+    a vacation in the ecobee app.
+  target:
+    entity:
+      domain: climate
+      integration: ecobee
+  fields:
+    name:
+      name: Vacation name
+      description: >-
+        Unique label for the vacation. ecobee uses this as the primary
+        key — duplicate names are rejected. Examples - "Spring Break"
+        or "Houston Astros World Series". Spaces and emoji are fine.
+      required: true
+      example: "Spring Break"
+      selector:
+        text:
+    start_datetime:
+      name: Start
+      description: >-
+        When the vacation begins. Defaults to "now" if omitted —
+        useful when triggering from a Door Lock event etc.
+      selector:
+        datetime:
+    end_datetime:
+      name: End
+      description: When the vacation ends and the schedule resumes.
+      required: true
+      selector:
+        datetime:
+    heat_temperature:
+      name: Heat setpoint (°F)
+      description: >-
+        Heat hold temperature. Defaults to 60°F (low setback for
+        away-equivalent) if not provided.
+      selector:
+        number:
+          min: 45
+          max: 95
+          step: 1
+          unit_of_measurement: "°F"
+          mode: box
+    cool_temperature:
+      name: Cool setpoint (°F)
+      description: >-
+        Cool hold temperature. Defaults to 85°F (high setback) if not
+        provided.
+      selector:
+        number:
+          min: 60
+          max: 99
+          step: 1
+          unit_of_measurement: "°F"
+          mode: box
+    fan_mode:
+      name: Fan mode
+      description: Fan setting during the vacation. Defaults to auto.
+      selector:
+        select:
+          options:
+            - auto
+            - "on"
+
+delete_vacation:
+  name: Delete vacation
+  description: >-
+    Cancel a previously-scheduled vacation by name. The thermostat
+    immediately resumes its schedule. No-op if the name doesn't match
+    any active vacation.
+  target:
+    entity:
+      domain: climate
+      integration: ecobee
+  fields:
+    name:
+      name: Vacation name
+      description: Must match exactly the name passed to create_vacation.
+      required: true
+      example: "Spring Break"
+      selector:
+        text:

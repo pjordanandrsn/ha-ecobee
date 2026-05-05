@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-05-05
+
+### Added
+- **Vacation events.** Two new domain-level services:
+  `ecobee.create_vacation` (name + start_datetime + end_datetime +
+  heat / cool setpoints + fan) and `ecobee.delete_vacation` (name).
+  These map to ecobee's `createVacation` / `deleteVacation` API
+  functions and are the right tool for "we're gone Mar 15–22, drop
+  to 60°F heat / 85°F cool with fan auto, then resume the schedule"
+  workflows that don't fit HA's preset_modes (which can't carry an
+  end time). Vacations show up on the climate entity's
+  `extra_state_attributes.vacations` list with name + running flag
+  + start/end + setpoints, and `vacation_active` is a quick boolean
+  for automation conditions.
+- `EcobeeApiClient.async_create_vacation`,
+  `EcobeeApiClient.async_delete_vacation`.
+
+### Notes
+- ecobee uses the vacation `name` as a primary key — duplicate names
+  return an error rather than overwriting. The service caller is
+  responsible for picking unique names; an HA convention to prefix
+  with the start date (e.g. `2026-03-15 Spring Break`) avoids
+  collisions when re-running the same template.
+- Active vacations don't surface as an HA `preset_mode` because the
+  preset selector can't carry the end time; the schedule's hold-style
+  presets (home/away/sleep) remain on `preset_mode` and are mutually
+  visible alongside the vacation in `extra_state_attributes`.
+
 ## [0.4.0] - 2026-05-05
 
 ### Added

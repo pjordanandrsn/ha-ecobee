@@ -286,3 +286,58 @@ class EcobeeApiClient:
                 ],
             }
         )
+
+    async def async_create_vacation(
+        self,
+        identifier: str,
+        *,
+        name: str,
+        start_date: str,
+        start_time: str,
+        end_date: str,
+        end_time: str,
+        heat_hold_temp_f10: int,
+        cool_hold_temp_f10: int,
+        fan: str = "auto",
+        fan_min_on_time: int = 0,
+    ) -> None:
+        """Create a vacation event with explicit start + end timestamps.
+
+        ecobee separates date and time into two fields each. Format:
+            start_date / end_date: 'YYYY-MM-DD'
+            start_time / end_time: 'HH:MM:SS' (24-hour, thermostat-local time)
+
+        Vacation ``name`` doubles as the unique identifier — passing the
+        same name as an existing vacation returns a 'duplicate name'
+        error rather than overwriting. Caller is responsible for picking
+        a unique name (the HA service handler suffixes with the start
+        timestamp to make collisions unlikely).
+        """
+        params = {
+            "name": name,
+            "coolHoldTemp": int(cool_hold_temp_f10),
+            "heatHoldTemp": int(heat_hold_temp_f10),
+            "startDate": start_date,
+            "startTime": start_time,
+            "endDate": end_date,
+            "endTime": end_time,
+            "fan": fan,
+            "fanMinOnTime": int(fan_min_on_time),
+        }
+        await self._post_thermostat(
+            {
+                "selection": self._selection(identifier),
+                "functions": [{"type": "createVacation", "params": params}],
+            }
+        )
+
+    async def async_delete_vacation(self, identifier: str, *, name: str) -> None:
+        """Cancel a vacation by name. Silently no-ops if no match."""
+        await self._post_thermostat(
+            {
+                "selection": self._selection(identifier),
+                "functions": [
+                    {"type": "deleteVacation", "params": {"name": name}}
+                ],
+            }
+        )

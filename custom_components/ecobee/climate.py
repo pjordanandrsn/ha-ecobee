@@ -251,6 +251,38 @@ class EcobeeThermostat(EcobeeBaseEntity, ClimateEntity):
         program = t.get("program") or {}
         attrs["current_climate"] = program.get("currentClimateRef")
         attrs["actualHumidity"] = runtime.get("actualHumidity")
+
+        # Vacation surfacing — list every event with type == 'vacation',
+        # active or scheduled. ecobee returns them in the same events
+        # array as holds, distinguished by ``type``. The HA frontend
+        # can't model an end-time on preset_modes, so we publish
+        # vacations as a list attribute and let the user act on it via
+        # the ecobee.delete_vacation service.
+        vacations: list[dict[str, Any]] = []
+        for e in events:
+            if e.get("type") != "vacation":
+                continue
+            vacations.append(
+                {
+                    "name": e.get("name"),
+                    "running": bool(e.get("running")),
+                    # ecobee returns these as 'YYYY-MM-DD' / 'HH:MM:SS'
+                    # strings — pass through verbatim so the user sees
+                    # the same values they'd see in the ecobee app.
+                    "start": f"{e.get('startDate', '?')} {e.get('startTime', '?')}",
+                    "end": f"{e.get('endDate', '?')} {e.get('endTime', '?')}",
+                    "heat_temp_f": (e.get("heatHoldTemp", 0) / 10.0)
+                    if e.get("heatHoldTemp") is not None
+                    else None,
+                    "cool_temp_f": (e.get("coolHoldTemp", 0) / 10.0)
+                    if e.get("coolHoldTemp") is not None
+                    else None,
+                    "fan": e.get("fan"),
+                }
+            )
+        attrs["vacations"] = vacations
+        attrs["vacation_active"] = any(v["running"] for v in vacations)
+
         return attrs
 
     # ─── preset + fan mode reads ──────────────────────────────────────
