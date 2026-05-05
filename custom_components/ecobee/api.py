@@ -6,15 +6,15 @@ based and its auth layer is the very thing we're replacing.
 
 ecobee's API has one quirk worth pointing out: GET requests pass their
 JSON-shaped ``selection`` object as a *query string* under
-``?json=<urlencoded JSON>``. We use ``urllib.parse.quote`` exactly once
-and let aiohttp pass the result through verbatim.
+``?json=<urlencoded JSON>``. POST requests send a JSON body with a
+``selection`` object plus either a ``thermostat`` patch (for direct
+settings updates) or a ``functions`` array (for hold-style operations
+like setHold / resumeProgram).
 
-We do not implement write-side endpoints (set_hvac_mode, set_hold, etc.)
-in this v0.1 — the integration's purpose is exposing per-room sensors
-that the SmartThings workaround hides. Read-only is enough for that.
-The climate entity is read-only as a result; users who need to change
-HVAC mode from HA can still do it via the SmartThings entry while it's
-running, or via the ecobee app.
+v0.4: write-side endpoints — set_hvac_mode, set_hold (setpoint +
+preset), resume_program, set_fan_mode. The selection used for writes
+is keyed by the thermostat ``identifier`` so each call targets exactly
+one device, which matters when an account has multiple thermostats.
 """
 
 from __future__ import annotations
@@ -147,3 +147,142 @@ class EcobeeApiClient:
             )
         _LOGGER.debug("ecobee poll OK: %d thermostat(s)", len(thermostats))
         return thermostats
+
+    # ─── write side ──────────────────────────────────────────────────
+
+    async def _post_thermostat(self, body: dict[str, Any]) -> None:
+        """POST /1/thermostat?format=json with the given JSON body.
+
+        The body shape for any write is::
+
+            {
+              "selection": {"selectionType": "thermostats",
+                            "selectionMatch": "<identifier>"},
+              "thermostat": {"settings": {...}},   # one of these,
+              "functions": [{"type": ..., "params": {...}}],  # not both
+            }
+
+        Successful writes return a status envelope with code=0; any
+        non-zero code is surfaced as an error so the climate entity's
+        action can fail loudly to HA's UI rather than silently no-op.
+        """
+        try:
+            access_token = await self._auth.ensure_access_token()
+        except InvalidGrantError as ex:
+            raise EcobeeAuthError(str(ex)) from ex
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json;charset=UTF-8",
+            "Accept": "application/json",
+        }
+        url = f"{API_THERMOSTAT}?format=json"
+        try:
+            async with self._session.post(
+                url, headers=headers, json=body, timeout=REQUEST_TIMEOUT
+            ) as resp:
+                status = resp.status
+                if status == 401:
+                    raise EcobeeAuthError(f"POST {API_THERMOSTAT} -> 401")
+                text = await resp.text()
+                if status != 200:
+                    raise EcobeeApiError(
+                        f"POST {API_THERMOSTAT} -> {status}: {text[:200]}"
+                    )
+                try:
+                    payload = json.loads(text)
+                except json.JSONDecodeError as ex:
+                    raise EcobeeApiError(
+                        f"malformed JSON from POST {API_THERMOSTAT}: {ex};"
+                        f" body={text[:200]!r}"
+                    ) from ex
+        except aiohttp.ClientError as ex:
+            raise EcobeeApiError(f"network error: {type(ex).__name__}: {ex}") from ex
+
+        status_blob = payload.get("status") or {}
+        code = status_blob.get("code", 0)
+        if code != 0:
+            msg = status_blob.get("message", "(no message)")
+            if code in (14, 16):
+                raise EcobeeAuthError(f"ecobee API auth code={code}: {msg}")
+            raise EcobeeApiError(f"ecobee API code={code}: {msg}")
+
+    @staticmethod
+    def _selection(identifier: str) -> dict[str, Any]:
+        return {
+            "selectionType": "thermostats",
+            "selectionMatch": identifier,
+        }
+
+    async def async_update_settings(
+        self, identifier: str, settings: dict[str, Any]
+    ) -> None:
+        """Patch the thermostat's ``settings`` object — used for hvacMode,
+        fan ``vent`` mode, hold-/away-circulate flags, etc."""
+        await self._post_thermostat(
+            {
+                "selection": self._selection(identifier),
+                "thermostat": {"settings": settings},
+            }
+        )
+
+    async def async_set_hold(
+        self,
+        identifier: str,
+        *,
+        heat_hold_temp_f10: int | None = None,
+        cool_hold_temp_f10: int | None = None,
+        hold_climate_ref: str | None = None,
+        hold_type: str = "nextTransition",
+        fan: str | None = None,
+    ) -> None:
+        """Apply a temperature- or program-based hold via setHold function.
+
+        Either supply explicit setpoints (``heat_hold_temp_f10`` /
+        ``cool_hold_temp_f10`` — F * 10 integers, ecobee's storage unit)
+        OR a ``hold_climate_ref`` ('home', 'away', 'sleep', custom). Mixing
+        both is fine; ecobee will use the climateRef's defaults for any
+        setpoint not provided.
+
+        ``hold_type`` choices: ``nextTransition`` (until next scheduled
+        program change — the ecobee app's default), ``indefinite``
+        (sticky until manually resumed), ``holdHours`` (paired with
+        ``params.holdHours`` — not exposed here yet).
+        """
+        params: dict[str, Any] = {"holdType": hold_type}
+        if heat_hold_temp_f10 is not None:
+            params["heatHoldTemp"] = int(heat_hold_temp_f10)
+        if cool_hold_temp_f10 is not None:
+            params["coolHoldTemp"] = int(cool_hold_temp_f10)
+        if hold_climate_ref is not None:
+            params["holdClimateRef"] = hold_climate_ref
+        if fan is not None:
+            # Per ecobee docs: passing fan='on' on a setHold forces the
+            # fan to run for the duration of the hold; default 'auto'
+            # follows the system's call.
+            params["fan"] = fan
+        await self._post_thermostat(
+            {
+                "selection": self._selection(identifier),
+                "functions": [{"type": "setHold", "params": params}],
+            }
+        )
+
+    async def async_resume_program(
+        self, identifier: str, *, resume_all: bool = True
+    ) -> None:
+        """Clear active holds. ``resume_all=True`` clears every stacked
+        hold in one call (recommended); ``False`` pops only the topmost,
+        which can leave the user wondering why one tap didn't return to
+        schedule."""
+        await self._post_thermostat(
+            {
+                "selection": self._selection(identifier),
+                "functions": [
+                    {
+                        "type": "resumeProgram",
+                        "params": {"resumeAll": bool(resume_all)},
+                    }
+                ],
+            }
+        )

@@ -4,6 +4,33 @@ All notable changes to this project are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-05-05
+
+### Added
+- **Climate write surface.** The thermostat entity is no longer
+  read-only — it now exposes the standard HA service surface:
+  `climate.set_hvac_mode`, `climate.set_temperature`,
+  `climate.set_fan_mode`, `climate.set_preset_mode`. Setpoints land
+  via ecobee's `setHold` function with `holdType=nextTransition`
+  (matches the ecobee app's default tap-to-adjust behaviour); preset
+  modes map to the thermostat's own program climates (`home`,
+  `away`, `sleep`, plus any custom climates the user defined in the
+  ecobee app), with a synthesised `none` preset that calls
+  `resumeProgram(resumeAll=true)` to return to the schedule.
+- `EcobeeApiClient.async_update_settings`,
+  `EcobeeApiClient.async_set_hold`,
+  `EcobeeApiClient.async_resume_program` — the underlying API plumbing.
+
+### Changed
+- `_attr_supported_features` on the climate entity flipped from `0`
+  to `TARGET_TEMPERATURE | TARGET_TEMPERATURE_RANGE | FAN_MODE |
+  PRESET_MODE` so HA renders the controls in the more-info card.
+
+### Why this took until 0.4
+- v0.1 was deliberately read-only as a guard against double-control
+  while the SmartThings entry was still installed. With that race
+  no longer a concern, the gate's gone.
+
 ## [0.3.1] - 2026-05-01
 
 ### Added

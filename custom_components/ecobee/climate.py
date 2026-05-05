@@ -1,42 +1,41 @@
 """Climate platform for the Ecobee community fork integration.
 
-Read-only v0.1: we expose current/target temperatures, current humidity,
-HVAC mode, and HVAC action so the dashboard can show the same data the
-SmartThings entry currently shows. We deliberately *don't* implement
-the write-side service handlers (set_hvac_mode, set_temperature, etc.)
-because:
+v0.4 adds the write surface — set_hvac_mode, set_temperature,
+set_fan_mode, set_preset_mode + an explicit "Resume program" preset
+that clears holds. Read side unchanged from v0.1.
 
-  - The user's stated need is per-room sensor visibility, not control.
-  - Implementing the full ecobee write surface (with hold types,
-    vacation events, fan-min-on-time, etc.) is a large amount of code
-    that would substantially expand the test surface for no payoff
-    relative to the integration's actual goal.
-  - Until SmartThings is removed, both integrations would race on
-    write — best to keep this one read-only as a guard against
-    accidental double-control during the verification window.
-
-If the user later wants control, this is the file to extend; the auth
-+ API plumbing is already wired for POST.
+Setpoints land via setHold (function-based POST) rather than direct
+runtime patches because runtime values are continuously overwritten by
+the active program; only a hold sticks. Preset mode maps to
+holdClimateRef (home / away / sleep / custom) through the same setHold.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
 
 from homeassistant.components.climate import (
+    ATTR_TARGET_TEMP_HIGH,
+    ATTR_TARGET_TEMP_LOW,
     ClimateEntity,
+    ClimateEntityFeature,
     HVACAction,
     HVACMode,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
+from .api import EcobeeApiError
 from .const import DOMAIN
 from .coordinator import EcobeeDataUpdateCoordinator
 from .entity import EcobeeBaseEntity, thermostat_device_info
+
+_LOGGER = logging.getLogger(__name__)
 
 # ecobee's ``hvacMode`` setting -> HA HVACMode. ``auxHeatOnly`` is
 # ecobee-specific (run aux/strip heat without compressor); we map it to
@@ -47,6 +46,15 @@ ECOBEE_HVAC_MODE_TO_HASS = {
     "auto": HVACMode.HEAT_COOL,
     "off": HVACMode.OFF,
     "auxHeatOnly": HVACMode.HEAT,
+}
+# Inverse for write side. We never write 'auxHeatOnly' from HA — the
+# user can't distinguish it from HEAT in the UI; ecobee will pick aux
+# automatically when the heat pump can't keep up.
+HASS_HVAC_MODE_TO_ECOBEE = {
+    HVACMode.HEAT: "heat",
+    HVACMode.COOL: "cool",
+    HVACMode.HEAT_COOL: "auto",
+    HVACMode.OFF: "off",
 }
 
 # Thermostat ``equipmentStatus`` is a comma-separated list of running
@@ -62,7 +70,18 @@ EQUIPMENT_TO_HVAC_ACTION = [
     ("ventilator", HVACAction.FAN),
 ]
 
-ATTR_FAN_MODE = "fan_mode"  # noqa: F841 (kept for future write-side use)
+# ecobee's fan modes are per-thermostat and per-program. The two
+# universally-supported values are 'auto' (run only when heating/cooling)
+# and 'on' (run continuously). Some models also support 'circulate' via
+# ``fanMinOnTime`` minutes; we don't expose that knob in v0.4 to keep
+# the UI simple.
+FAN_MODE_AUTO = "auto"
+FAN_MODE_ON = "on"
+
+# A synthesised preset that means "clear all holds and follow the
+# schedule again". Not an ecobee climateRef — handled specially in
+# async_set_preset_mode.
+PRESET_NONE = "none"
 
 
 async def async_setup_entry(
@@ -82,11 +101,17 @@ async def async_setup_entry(
 
 
 class EcobeeThermostat(EcobeeBaseEntity, ClimateEntity):
-    """Read-only climate entity backed by an ecobee thermostat."""
+    """Read+write climate entity backed by an ecobee thermostat."""
 
     _attr_temperature_unit = UnitOfTemperature.FAHRENHEIT
-    _attr_supported_features = 0  # read-only — see module docstring
+    _attr_supported_features = (
+        ClimateEntityFeature.TARGET_TEMPERATURE
+        | ClimateEntityFeature.TARGET_TEMPERATURE_RANGE
+        | ClimateEntityFeature.FAN_MODE
+        | ClimateEntityFeature.PRESET_MODE
+    )
     _attr_hvac_modes = [HVACMode.OFF, HVACMode.HEAT, HVACMode.COOL, HVACMode.HEAT_COOL]
+    _attr_fan_modes = [FAN_MODE_AUTO, FAN_MODE_ON]
 
     @property
     def name(self) -> Optional[str]:
@@ -227,3 +252,198 @@ class EcobeeThermostat(EcobeeBaseEntity, ClimateEntity):
         attrs["current_climate"] = program.get("currentClimateRef")
         attrs["actualHumidity"] = runtime.get("actualHumidity")
         return attrs
+
+    # ─── preset + fan mode reads ──────────────────────────────────────
+
+    @property
+    def preset_modes(self) -> Optional[list[str]]:
+        """Build the preset list from the thermostat's program climates.
+
+        ecobee ships three default climates (home / away / sleep) plus
+        any user-defined ones. We always prepend PRESET_NONE so the UI
+        has a path back to the schedule from a stuck hold.
+        """
+        t = self.thermostat
+        if t is None:
+            return [PRESET_NONE]
+        program = t.get("program") or {}
+        climates = program.get("climates") or []
+        names: list[str] = []
+        for c in climates:
+            ref = c.get("climateRef") or c.get("name")
+            if ref and ref not in names:
+                names.append(ref)
+        return [PRESET_NONE, *names]
+
+    @property
+    def preset_mode(self) -> Optional[str]:
+        """The active preset is the topmost hold's climateRef, if any.
+
+        With no holds, we report PRESET_NONE rather than the schedule's
+        current climate — leaving "none" visible makes it obvious that
+        the thermostat is on the schedule rather than on a hold.
+        """
+        t = self.thermostat
+        if t is None:
+            return None
+        events = t.get("events") or []
+        for e in events:
+            if e.get("running") and e.get("type") == "hold":
+                ref = e.get("holdClimateRef")
+                if ref:
+                    return ref
+                # Hold without a climateRef = direct setpoint hold; map
+                # back to "none" so the UI doesn't pick a misleading label.
+                return PRESET_NONE
+        return PRESET_NONE
+
+    @property
+    def fan_mode(self) -> Optional[str]:
+        """Return the current fan mode.
+
+        While a hold is active, the running event carries the live fan
+        setting; otherwise fall back to the active program climate.
+        """
+        t = self.thermostat
+        if t is None:
+            return None
+        events = t.get("events") or []
+        for e in events:
+            if e.get("running"):
+                fan = e.get("fan")
+                if fan in (FAN_MODE_AUTO, FAN_MODE_ON):
+                    return fan
+        program = t.get("program") or {}
+        climates = program.get("climates") or []
+        current_ref = program.get("currentClimateRef")
+        for c in climates:
+            if c.get("climateRef") == current_ref:
+                fan = c.get("fan")
+                if fan in (FAN_MODE_AUTO, FAN_MODE_ON):
+                    return fan
+        return None
+
+    # ─── write side ──────────────────────────────────────────────────
+
+    async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
+        ecobee_mode = HASS_HVAC_MODE_TO_ECOBEE.get(hvac_mode)
+        if ecobee_mode is None:
+            raise HomeAssistantError(f"Unsupported hvac_mode: {hvac_mode}")
+        try:
+            await self.coordinator.api.async_update_settings(
+                self._thermostat_identifier, {"hvacMode": ecobee_mode}
+            )
+        except EcobeeApiError as ex:
+            raise HomeAssistantError(f"ecobee set_hvac_mode failed: {ex}") from ex
+        await self.coordinator.async_request_refresh()
+
+    async def async_set_temperature(self, **kwargs: Any) -> None:
+        """Apply a temperature hold.
+
+        Single-setpoint mode (HEAT or COOL) sends ``temperature``; auto
+        mode sends ``target_temp_low`` + ``target_temp_high``. ecobee
+        wants both setpoints on every setHold even in single-mode (the
+        unused side is ignored), so we read whichever is missing back
+        from the current state to keep the call balanced.
+        """
+        mode = self.hvac_mode
+        # Read current setpoints once; defaults below cover the case
+        # where the thermostat hasn't reported them yet.
+        cur_low = self.target_temperature_low
+        cur_high = self.target_temperature_high
+        cur_single = self.target_temperature
+
+        target = kwargs.get(ATTR_TEMPERATURE)
+        target_low = kwargs.get(ATTR_TARGET_TEMP_LOW)
+        target_high = kwargs.get(ATTR_TARGET_TEMP_HIGH)
+
+        if mode == HVACMode.HEAT_COOL:
+            if target_low is None and target_high is None:
+                raise HomeAssistantError(
+                    "auto mode requires both target_temp_low and target_temp_high"
+                )
+            heat_f = float(target_low if target_low is not None else cur_low or 68)
+            cool_f = float(target_high if target_high is not None else cur_high or 76)
+        elif mode == HVACMode.HEAT:
+            if target is None:
+                raise HomeAssistantError("heat mode requires temperature")
+            heat_f = float(target)
+            cool_f = float(cur_high if cur_high is not None else (cur_single or 76) + 4)
+        elif mode == HVACMode.COOL:
+            if target is None:
+                raise HomeAssistantError("cool mode requires temperature")
+            cool_f = float(target)
+            heat_f = float(cur_low if cur_low is not None else (cur_single or 68) - 4)
+        else:
+            raise HomeAssistantError(
+                f"Cannot set temperature while hvac_mode is {mode}"
+            )
+
+        try:
+            await self.coordinator.api.async_set_hold(
+                self._thermostat_identifier,
+                heat_hold_temp_f10=int(round(heat_f * 10)),
+                cool_hold_temp_f10=int(round(cool_f * 10)),
+                hold_type="nextTransition",
+            )
+        except EcobeeApiError as ex:
+            raise HomeAssistantError(f"ecobee set_temperature failed: {ex}") from ex
+        await self.coordinator.async_request_refresh()
+
+    async def async_set_fan_mode(self, fan_mode: str) -> None:
+        if fan_mode not in (FAN_MODE_AUTO, FAN_MODE_ON):
+            raise HomeAssistantError(f"Unsupported fan_mode: {fan_mode}")
+        # Setting fan mode without a setpoint change means re-issuing
+        # the existing setpoints under a hold with the new fan value.
+        cur_low = self.target_temperature_low
+        cur_high = self.target_temperature_high
+        cur_single = self.target_temperature
+        if self.hvac_mode == HVACMode.HEAT_COOL:
+            heat_f = float(cur_low or 68)
+            cool_f = float(cur_high or 76)
+        elif self.hvac_mode == HVACMode.HEAT:
+            heat_f = float(cur_single or 68)
+            cool_f = float((cur_single or 68) + 8)
+        elif self.hvac_mode == HVACMode.COOL:
+            cool_f = float(cur_single or 76)
+            heat_f = float((cur_single or 76) - 8)
+        else:
+            # Off mode — issue a fan-only hold by passing through climateRef
+            # 'home' so we don't accidentally write nonsense setpoints.
+            try:
+                await self.coordinator.api.async_set_hold(
+                    self._thermostat_identifier,
+                    hold_climate_ref="home",
+                    fan=fan_mode,
+                )
+            except EcobeeApiError as ex:
+                raise HomeAssistantError(f"ecobee set_fan_mode failed: {ex}") from ex
+            await self.coordinator.async_request_refresh()
+            return
+
+        try:
+            await self.coordinator.api.async_set_hold(
+                self._thermostat_identifier,
+                heat_hold_temp_f10=int(round(heat_f * 10)),
+                cool_hold_temp_f10=int(round(cool_f * 10)),
+                fan=fan_mode,
+            )
+        except EcobeeApiError as ex:
+            raise HomeAssistantError(f"ecobee set_fan_mode failed: {ex}") from ex
+        await self.coordinator.async_request_refresh()
+
+    async def async_set_preset_mode(self, preset_mode: str) -> None:
+        try:
+            if preset_mode == PRESET_NONE:
+                await self.coordinator.api.async_resume_program(
+                    self._thermostat_identifier, resume_all=True
+                )
+            else:
+                await self.coordinator.api.async_set_hold(
+                    self._thermostat_identifier,
+                    hold_climate_ref=preset_mode,
+                    hold_type="nextTransition",
+                )
+        except EcobeeApiError as ex:
+            raise HomeAssistantError(f"ecobee set_preset_mode failed: {ex}") from ex
+        await self.coordinator.async_request_refresh()
